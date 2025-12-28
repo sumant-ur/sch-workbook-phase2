@@ -69,7 +69,7 @@ def main():
 
     # Details Tab
     with details_tab:
-        display_details_tab(df_filtered, active_region)
+        display_details_tab(df_filtered, active_region, filters["end_ts"])
 
 
 if __name__ == "__main__":

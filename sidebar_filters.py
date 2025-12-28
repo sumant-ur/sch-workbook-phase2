@@ -21,17 +21,31 @@ def create_sidebar_filters(regions, df_region):
         st.sidebar.warning("No regions available")
 
     # Date range selector
-    if not df_region.empty:
-        min_date = df_region["Date"].min()
-        max_date = df_region["Date"].max()
+    # Default should be: last 10 days through next 30 days (from today)
+    today = date.today()
+    default_start = today - timedelta(days=10)
+    default_end = today + timedelta(days=30)
+
+    # Keep the picker bounds wide enough to include both:
+    # - the dataset min/max (when available)
+    # - the desired default window (today-10 .. today+30)
+    if not df_region.empty and "Date" in df_region.columns:
+        df_min = df_region["Date"].min()
+        df_max = df_region["Date"].max()
+        df_min_d = df_min.date() if pd.notna(df_min) else default_start
+        df_max_d = df_max.date() if pd.notna(df_max) else default_end
     else:
-        min_date = pd.Timestamp.today() - timedelta(days=30)
-        max_date = pd.Timestamp.today()
+        df_min_d = default_start
+        df_max_d = default_end
+
+    min_value = min(df_min_d, default_start)
+    max_value = max(df_max_d, default_end)
 
     date_range = st.sidebar.date_input(
         "Date Range",
-        value=(min_date.date() if pd.notna(min_date) else date.today(),
-               max_date.date() if pd.notna(max_date) else date.today()),
+        value=(default_start, default_end),
+        min_value=min_value,
+        max_value=max_value,
         key=f"date_{active_region}"
     )
 

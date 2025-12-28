@@ -63,6 +63,10 @@ def _normalize_inventory_df(raw_df: pd.DataFrame) -> pd.DataFrame:
 
     df["Notes"] = ""
 
+    # Row lineage tracking (for SQLite we persist these columns; for Snowflake they may not exist)
+    df["source"] = _col(raw_df, "source", "system").fillna("system")
+    df["updated"] = pd.to_numeric(_col(raw_df, "updated", 0), errors="coerce").fillna(0).astype(int)
+
     midcon_mask = df["Region"] == "Group Supply Report (Midcon)"
     needs_system = midcon_mask & df["System"].isna()
     df.loc[needs_system, "System"] = df.loc[needs_system, "Location"]
