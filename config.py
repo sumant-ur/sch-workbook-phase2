@@ -26,6 +26,16 @@ INTRANSIT_DEFAULTS = {
 GLOBAL_REQUIRED_MAX_FALLBACK = 10000  # used if no specific default found
 GLOBAL_INTRANSIT_FALLBACK = 0         # used if no specific default found
 
+# Required Minimum defaults/fallbacks
+# If a specific "Location|Product" (or "System|Product") key is not present,
+# we will fall back to product-level default, otherwise to this global fallback.
+REQUIRED_MIN_DEFAULTS = {
+    # "Houston|ULSD": 3000,
+    # "ULSD": 2500,
+}
+
+GLOBAL_REQUIRED_MIN_FALLBACK = 0
+
 # Table definitions
 RAW_INVENTORY_TABLE = "CONSUMPTION.HFS_COMMERCIAL_INVENTORY.DAILY_INVENTORY_FACT"
 

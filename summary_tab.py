@@ -8,9 +8,11 @@ import pandas as pd
 import numpy as np
 from config import (
     REQUIRED_MAX_DEFAULTS,
+    REQUIRED_MIN_DEFAULTS,
     INTRANSIT_DEFAULTS,
     GLOBAL_REQUIRED_MAX_FALLBACK,
-    GLOBAL_INTRANSIT_FALLBACK
+    GLOBAL_REQUIRED_MIN_FALLBACK,
+    GLOBAL_INTRANSIT_FALLBACK,
 )
 
 
@@ -46,26 +48,52 @@ def calculate_intransit(row, group_cols, df_filtered):
     # Use Pipeline In data or defaults
     if group_cols[0] == "System":
         key = f"{row['System']}|{row['Product']}"
-        prod_key = row['Product']
+        prod_key = row["Product"]
     else:
         key = f"{row['Location']}|{row['Product']}"
-        prod_key = row['Product']
+        prod_key = row["Product"]
 
     if key in INTRANSIT_DEFAULTS:
         return INTRANSIT_DEFAULTS[key]
-    elif prod_key in INTRANSIT_DEFAULTS:
+    if prod_key in INTRANSIT_DEFAULTS:
         return INTRANSIT_DEFAULTS[prod_key]
-    else:
-        # Use average pipeline in as intransit estimate
-        pipeline_data = df_filtered[
-            (df_filtered[group_cols[0]] == row[group_cols[0]]) &
-            (df_filtered["Product"] == row["Product"])
-        ]["Pipeline In"].mean()
 
-        if pd.notna(pipeline_data) and pipeline_data > 0:
-            return pipeline_data
-        else:
-            return GLOBAL_INTRANSIT_FALLBACK
+    # Use average pipeline in as intransit estimate
+    pipeline_data = df_filtered[
+        (df_filtered[group_cols[0]] == row[group_cols[0]]) &
+        (df_filtered["Product"] == row["Product"])
+    ]["Pipeline In"].mean()
+
+    if pd.notna(pipeline_data) and pipeline_data > 0:
+        return pipeline_data
+
+    return GLOBAL_INTRANSIT_FALLBACK
+
+
+def calculate_required_min(row, group_cols, df_filtered):
+    """Calculate required minimum based on historical data or defaults."""
+    if group_cols[0] == "System":
+        key = f"{row['System']}|{row['Product']}"
+        prod_key = row["Product"]
+    else:
+        key = f"{row['Location']}|{row['Product']}"
+        prod_key = row["Product"]
+
+    if key in REQUIRED_MIN_DEFAULTS:
+        return REQUIRED_MIN_DEFAULTS[key]
+    if prod_key in REQUIRED_MIN_DEFAULTS:
+        return REQUIRED_MIN_DEFAULTS[prod_key]
+
+    # Calculate based on tank capacity if available
+    tank_cap = df_filtered[
+        (df_filtered[group_cols[0]] == row[group_cols[0]]) &
+        (df_filtered["Product"] == row["Product"])
+    ]["Tank Capacity"].max()
+
+    if pd.notna(tank_cap) and tank_cap > 0:
+        return tank_cap * 0.15
+
+    return GLOBAL_REQUIRED_MIN_FALLBACK
 
 
 def display_regional_summary(df_filtered, active_region):
@@ -147,87 +175,72 @@ def display_regional_summary(df_filtered, active_region):
         pds = latest[group_cols].copy()
         pds["Prior_Day_Sales"] = 0
 
-    # Total aggregates
-    totals = (
-        df_filtered
-        .groupby(group_cols, as_index=False)
-        .agg({
-            "Batch In (RECEIPTS_BBL)": "sum",
-            "Batch Out (DELIVERIES_BBL)": "sum",
-            "Rack/Liftings": "sum"
-        })
-        .rename(columns={
-            "Batch In (RECEIPTS_BBL)": "Total In",
-            "Batch Out (DELIVERIES_BBL)": "Total Out",
-            "Rack/Liftings": "Total Rack"
-        })
-    )
-
     # Build summary DataFrame
     summary_df = (
         latest[group_cols + ["Close Inv"]]
-        .merge(totals, on=group_cols, how="left")
         .merge(pds, on=group_cols, how="left")
         .merge(seven_day, on=group_cols, how="left")
     )
 
-    # Calculate Required Max and Intransit
-    summary_df["Required Maximums"] = summary_df.apply(
+    # Calculate Required Min/Max and In-Transit
+    summary_df["Required Maximum"] = summary_df.apply(
         lambda row: calculate_required_max(row, group_cols, df_filtered),
-        axis=1
+        axis=1,
     ).astype(float)
 
-    summary_df["Intransit Bbls"] = summary_df.apply(
+    summary_df["Required Minimum"] = summary_df.apply(
+        lambda row: calculate_required_min(row, group_cols, df_filtered),
+        axis=1,
+    ).astype(float)
+
+    summary_df["In-Transit"] = summary_df.apply(
         lambda row: calculate_intransit(row, group_cols, df_filtered),
-        axis=1
+        axis=1,
     ).astype(float)
 
-    # Calculate inventory metrics
-    summary_df["Gross Inventory"] = (
-        summary_df["Close Inv"].fillna(0) +
-        summary_df["Intransit Bbls"].fillna(0)
+    # Inventory metrics
+    summary_df["Gross Inventory"] = summary_df["Close Inv"].fillna(0).astype(float)
+    summary_df["Total Inventory"] = (
+        summary_df["Gross Inventory"] + summary_df["In-Transit"].fillna(0)
     ).astype(float)
 
-    summary_df["Avail. (NET) Inventory"] = (
-        summary_df["Gross Inventory"] -
-        summary_df["Required Maximums"]
+    summary_df["Available Net Inventory"] = (
+        summary_df["Total Inventory"] - summary_df["Required Minimum"].fillna(0)
     ).astype(float)
 
     # Days supply calculation
     sda = summary_df["Seven_Day_Avg_Sales"].replace({0: np.nan})
-    summary_df["# Days Supply"] = (
-        summary_df["Close Inv"] / sda
+    summary_df["Number days' Supply"] = (
+        summary_df["Total Inventory"] / sda
     ).replace([np.inf, -np.inf], np.nan)
 
     # Display formatting
     if active_region == "Group Supply Report (Midcon)":
-        display_df = summary_df.rename(columns={
-            "System": "System",
-            "Product": "Product",
-            "Close Inv": "Closing Inv",
-            "Prior_Day_Sales": "Prior Day Sales",
-            "Seven_Day_Avg_Sales": "7 Day Average"
-        })
-        desired_order = [
-            "System", "Product", "Closing Inv", "Intransit Bbls",
-            "Gross Inventory", "Required Maximums", "Avail. (NET) Inventory",
-            "Prior Day Sales", "7 Day Average", "# Days Supply",
-            "Total In", "Total Out", "Total Rack"
-        ]
+        display_df = summary_df.copy()
+        display_df["Location"] = display_df["System"]
     else:
-        display_df = summary_df.rename(columns={
-            "Location": "Location",
-            "Product": "Product",
-            "Close Inv": "Closing Inv",
+        display_df = summary_df.copy()
+
+    display_df = display_df.rename(
+        columns={
             "Prior_Day_Sales": "Prior Day Sales",
-            "Seven_Day_Avg_Sales": "7 Day Average"
-        })
-        desired_order = [
-            "Location", "Product", "Closing Inv", "Intransit Bbls",
-            "Gross Inventory", "Required Maximums", "Avail. (NET) Inventory",
-            "Prior Day Sales", "7 Day Average", "# Days Supply",
-            "Total In", "Total Out", "Total Rack"
-        ]
+            "Seven_Day_Avg_Sales": "7 Day Average",
+        }
+    )
+
+    desired_order = [
+        "Location",
+        "Product",
+        "Available Net Inventory",
+        "Prior Day Sales",
+        "7 Day Average",
+        "Number days' Supply",
+        "Required Minimum",
+        "Required Maximum",
+        "In-Transit",
+        "Gross Inventory",
+        "Total Inventory",
+    ]
 
     final_cols = [c for c in desired_order if c in display_df.columns]
     st.dataframe(
@@ -275,22 +288,19 @@ def display_forecast_table(df_filtered, active_region):
         forecast_row = {
             group_cols[0]: row[group_cols[0]],
             "Product": row["Product"],
-            "Current Inventory": round(current_inv, 0),
-            "EOM Projections": round(current_inv + (avg_daily_change * 30), 0),
-            "LIFO Target": round(current_inv * 1.1, 0),
-            "OPS Target": round(current_inv * 1.05, 0),
-            "EOM vs OPS": round((current_inv + (avg_daily_change * 30)) - (current_inv * 1.05), 0),
-            "LIFO vs OPS": round((current_inv * 1.1) - (current_inv * 1.05), 0),
-            "Build and Draw": round(avg_daily_change * 30, 0)
+            "Beginning inventory": round(current_inv, 0),
+            "Projected EOM": round(current_inv + (avg_daily_change * 30), 0),
+            "Build/Draw": round(avg_daily_change * 30, 0),
         }
         forecast_data.append(forecast_row)
 
     if forecast_data:
         forecast_df = pd.DataFrame(forecast_data)
-        forecast_cols = [
-            group_cols[0], "Product", "Current Inventory", "EOM Projections",
-            "LIFO Target", "OPS Target", "EOM vs OPS", "LIFO vs OPS", "Build and Draw"
-        ]
+        if group_cols[0] == "System":
+            forecast_df = forecast_df.rename(columns={"System": "Location"})
+
+        forecast_cols = ["Location", "Product", "Beginning inventory", "Projected EOM", "Build/Draw"]
+        forecast_cols = [c for c in forecast_cols if c in forecast_df.columns]
         st.dataframe(forecast_df[forecast_cols], width="stretch", height=320)
     else:
         st.info("No forecast data available for the selected filters.")

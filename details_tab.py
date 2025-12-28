@@ -10,10 +10,8 @@ DETAILS_RENAME = {
     "Rack/Liftings": "Rack/Lifting",
 }
 
-# Columns shown in the Details tab (order matters)
 DETAILS_COLS = [
-    "source",  # system | forecast | manual
-    # "updated",  # 0/1 flag
+    "source",
     "Product",
     "Close Inv",
     "Opening Inv",
@@ -27,11 +25,6 @@ DETAILS_COLS = [
     "Notes",
 ]
 
-
-# --- Forecasting helpers ----------------------------------------------------
-
-# These are the columns we forecast directly via weekday-weighted averages.
-# Open/Close inventory are derived (roll-forward) and are NOT directly averaged.
 FORECAST_FLOW_COLS = [
     "Batch In (RECEIPTS_BBL)",
     "Batch Out (DELIVERIES_BBL)",
@@ -64,86 +57,125 @@ NET_COLS = [
 
 
 def _aggregate_daily_details(df: pd.DataFrame, id_col: str) -> pd.DataFrame:
-    """Normalize raw rows into 1 row per (Date, id_col, Product).
-
-    The source data can contain multiple rows per date; Details view should show
-    the daily total flows and a single opening/closing inventory snapshot.
-    """
     if df.empty:
         return df
 
-    # Ensure Date is datetime
     df = df.copy()
-    df["Date"] = pd.to_datetime(df["Date"], errors="coerce")
+    df["Date"] = pd.to_datetime(df["Date"])
 
     group_cols = ["Date", id_col, "Product"]
-    agg_map = {}
+    agg_map: dict[str, str] = {}
 
-    # Inventory snapshots
     if "Open Inv" in df.columns:
         agg_map["Open Inv"] = "first"
     if "Close Inv" in df.columns:
         agg_map["Close Inv"] = "last"
 
-    # Flow columns -> sum
-    for c in [c for c in FORECAST_FLOW_COLS if c in df.columns]:
+    for c in _available_flow_cols(df):
         agg_map[c] = "sum"
 
-    # Lineage flags: when multiple rows exist for the same day, keep a stable tag.
     if "source" in df.columns:
         agg_map["source"] = "first"
     if "updated" in df.columns:
         agg_map["updated"] = "max"
-
     if "Notes" in df.columns:
-        # Keep something readable (last note of the day)
         agg_map["Notes"] = "last"
 
-    daily = df.groupby(group_cols, as_index=False).agg(agg_map)
-    return daily
+    return df.groupby(group_cols, as_index=False).agg(agg_map)
 
 
-def _weighted_weekday_means(
+def _available_flow_cols(df: pd.DataFrame) -> list[str]:
+    return [c for c in FORECAST_FLOW_COLS if c in df.columns]
+
+
+def _ensure_lineage_cols(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    if "source" not in out.columns:
+        out["source"] = "system"
+    else:
+        out["source"] = out["source"].fillna("system")
+
+    if "updated" not in out.columns:
+        out["updated"] = 0
+    else:
+        out["updated"] = pd.to_numeric(out["updated"]).fillna(0).astype(int)
+
+    return out
+
+
+def _weekday_weighted_means(
     hist: pd.DataFrame,
-    value_cols: list[str],
+    flow_cols: list[str],
     max_weeks: int = 6,
     decay: float = 0.70,
 ) -> dict[tuple[int, str], float]:
-    """Return {(weekday, col): weighted_mean} using last N occurrences.
+    if hist.empty or not flow_cols:
+        return {}
 
-    For a given weekday, we take up to `max_weeks` most recent occurrences and
-    apply exponentially decaying weights (most recent gets the largest weight).
-    """
-    out: dict[tuple[int, str], float] = {}
-    if hist.empty:
-        return out
-
-    h = hist.sort_values("Date")
+    h = hist.sort_values("Date").copy()
     h["__weekday"] = h["Date"].dt.weekday
 
-    # Fallback (overall) means from recent window, used when a weekday has no history
     recent = h.tail(21)
-    fallback_means = {c: float(recent[c].mean()) if c in recent.columns and len(recent) else 0.0 for c in value_cols}
+    fallback = {c: float(recent[c].mean()) if c in recent.columns and len(recent) else 0.0 for c in flow_cols}
 
+    out: dict[tuple[int, str], float] = {}
     for wd in range(7):
-        subset = h[h["__weekday"] == wd].sort_values("Date", ascending=False)
+        subset = h[h["__weekday"] == wd].sort_values("Date", ascending=False).head(max_weeks)
         if subset.empty:
-            for c in value_cols:
-                out[(wd, c)] = fallback_means.get(c, 0.0)
+            for c in flow_cols:
+                out[(wd, c)] = fallback.get(c, 0.0)
             continue
 
-        subset = subset.head(max_weeks)
         weights = np.array([decay**i for i in range(len(subset))], dtype=float)
-        wsum = float(weights.sum()) if float(weights.sum()) != 0 else 1.0
+        wsum = float(weights.sum()) or 1.0
 
-        for c in value_cols:
-            if c not in subset.columns:
-                out[(wd, c)] = fallback_means.get(c, 0.0)
-                continue
-            vals = subset[c].astype(float).to_numpy()
+        for c in flow_cols:
+            vals = subset[c].astype(float).to_numpy() if c in subset.columns else np.zeros(len(subset), dtype=float)
             out[(wd, c)] = float((vals * weights).sum() / wsum)
 
     return out
+
+
+def estimate_forecast_flows(
+    group: pd.DataFrame,
+    flow_cols: list[str],
+    d: pd.Timestamp,
+) -> dict[str, float]:
+    means = _weekday_weighted_means(group, flow_cols=flow_cols)
+    wd = int(d.weekday())
+    return {c: float(means.get((wd, c), 0.0)) for c in flow_cols}
+
+
+def _roll_inventory(prev_close: float, flows: dict[str, float], flow_cols: list[str]) -> tuple[float, float]:
+    opening = float(prev_close)
+    inflow = sum(float(flows.get(c, 0.0) or 0.0) for c in INFLOW_COLS if c in flow_cols)
+    outflow = sum(float(flows.get(c, 0.0) or 0.0) for c in OUTFLOW_COLS if c in flow_cols)
+    net = sum(float(flows.get(c, 0.0) or 0.0) for c in NET_COLS if c in flow_cols)
+    closing = opening + inflow - outflow + net
+    return opening, closing
+
+
+def _forecast_dates(last_date: pd.Timestamp, forecast_end: pd.Timestamp | None, default_days: int) -> pd.DatetimeIndex:
+    start = last_date + timedelta(days=1)
+    if forecast_end is not None:
+        if start > forecast_end:
+            return pd.DatetimeIndex([])
+        return pd.date_range(start=start, end=forecast_end, freq="D")
+    return pd.date_range(start=start, periods=int(default_days), freq="D")
+
+
+def _last_close_inv(group: pd.DataFrame) -> float:
+    if "Close Inv" not in group.columns:
+        return 0.0
+
+    last_date = group["Date"].max()
+    last_rows = group[group["Date"] == last_date]
+    if last_rows.empty:
+        return 0.0
+
+    val = last_rows["Close Inv"].iloc[-1]
+    return float(val) if pd.notna(val) else 0.0
 
 
 def _extend_with_30d_forecast(
@@ -153,121 +185,62 @@ def _extend_with_30d_forecast(
     forecast_end: pd.Timestamp | None = None,
     default_days: int = 30,
 ) -> pd.DataFrame:
-    """Append forecast rows per (id_col, Product) based on weekday averages.
-
-    If `forecast_end` is provided, rows are generated ONLY from the day after the
-    last available date through `forecast_end` (inclusive).
-
-    If `forecast_end` is None, we fall back to the historical behavior and
-    generate `default_days` rows.
-    """
-
     if df.empty:
         return df
 
-    # Aggregate to daily first, then forecast
     daily = _aggregate_daily_details(df, id_col=id_col)
     if daily.empty:
         return daily
 
-    daily = daily.sort_values("Date")
+    daily = _ensure_lineage_cols(daily).sort_values("Date")
+    flow_cols = _available_flow_cols(daily)
 
-    # Existing rows from the pipeline / DB are considered 'system' rows unless already tagged.
-    if "source" not in daily.columns:
-        daily["source"] = "system"
-    else:
-        daily["source"] = daily["source"].fillna("system")
-
-    if "updated" not in daily.columns:
-        daily["updated"] = 0
-    else:
-        daily["updated"] = pd.to_numeric(daily["updated"], errors="coerce").fillna(0).astype(int)
-
-    # Which flow columns are available in this dataset?
-    flow_cols = [c for c in FORECAST_FLOW_COLS if c in daily.columns]
-
-    # Normalize forecast_end (if supplied) to a plain timestamp (no time component assumptions)
     if forecast_end is not None:
-        forecast_end = pd.to_datetime(forecast_end, errors="coerce")
-        if pd.isna(forecast_end):
-            forecast_end = None
+        forecast_end = pd.Timestamp(forecast_end)
 
     forecast_rows: list[dict] = []
 
-    for (id_val, product), g in daily.groupby([id_col, "Product"], dropna=False):
-        g = g.sort_values("Date")
-        last_date = pd.to_datetime(g["Date"].max())
+    for (id_val, product), group in daily.groupby([id_col, "Product"], dropna=False):
+        group = group.sort_values("Date")
+        last_date = pd.Timestamp(group["Date"].max())
+        prev_close = _last_close_inv(group)
+        for d in _forecast_dates(last_date, forecast_end, default_days):
+            flows = estimate_forecast_flows(group, flow_cols=flow_cols, d=d)
+            opening, closing = _roll_inventory(prev_close, flows, flow_cols)
+            prev_close = closing
 
-        # Use last known closing inventory as the starting point
-        if "Close Inv" in g.columns and g["Close Inv"].notna().any():
-            prev_close = float(g.loc[g["Date"] == last_date, "Close Inv"].iloc[-1])
-        else:
-            prev_close = 0.0
-
-        weekday_means = _weighted_weekday_means(g, value_cols=flow_cols)
-
-        start = last_date + timedelta(days=1)
-
-        if forecast_end is not None:
-            # If user-selected range ends before (or on) the last actual date, no forecast needed.
-            if start > forecast_end:
-                continue
-            dates = pd.date_range(start=start, end=forecast_end, freq="D")
-        else:
-            dates = pd.date_range(start=start, periods=int(default_days), freq="D")
-
-        for d in dates:
-            wd = int(d.weekday())
-
-            row: dict = {
+            row = {
                 "Date": d,
                 id_col: id_val,
                 "Product": product,
                 "source": "forecast",
                 "updated": 0,
-                "Notes": "Forecast (weekday weighted avg)",
+                "Notes": "Forecast",
+                "Open Inv": opening,
+                "Close Inv": closing,
+                **flows,
             }
-
-            # Fill forecasted flows
-            for c in flow_cols:
-                row[c] = weekday_means.get((wd, c), 0.0)
-
-            # Roll-forward inventory math
-            opening = prev_close
-            inflow = sum(float(row.get(c, 0.0) or 0.0) for c in INFLOW_COLS if c in flow_cols)
-            outflow = sum(float(row.get(c, 0.0) or 0.0) for c in OUTFLOW_COLS if c in flow_cols)
-            net = sum(float(row.get(c, 0.0) or 0.0) for c in NET_COLS if c in flow_cols)
-
-            closing = opening + inflow - outflow + net
-
-            row["Open Inv"] = opening
-            row["Close Inv"] = closing
-
-            prev_close = closing
             forecast_rows.append(row)
 
     if not forecast_rows:
         return daily
 
-    forecast_df = pd.DataFrame(forecast_rows)
-
-    # Combine and keep numeric columns numeric
-    combined = pd.concat([daily, forecast_df], ignore_index=True)
+    combined = pd.concat([daily, pd.DataFrame(forecast_rows)], ignore_index=True)
     for c in ["Open Inv", "Close Inv"] + flow_cols:
         if c in combined.columns:
-            combined[c] = pd.to_numeric(combined[c], errors="coerce").fillna(0.0)
+            combined[c] = pd.to_numeric(combined[c]).fillna(0.0)
 
     return combined
 
 
-def build_details_view(df, id_col: str):
+def build_details_view(df: pd.DataFrame, id_col: str):
     df = df.sort_values("Date").rename(columns=DETAILS_RENAME)
     cols = ["Date", id_col] + DETAILS_COLS
     cols = [c for c in cols if c in df.columns]
     return df, cols
 
 
-def display_midcon_details(df_filtered, active_region, forecast_end: pd.Timestamp):
+def display_midcon_details(df_filtered: pd.DataFrame, active_region: str, forecast_end: pd.Timestamp):
     st.subheader("🧾 Group Daily Details")
 
     source_cfg = st.column_config.SelectboxColumn(
@@ -286,14 +259,11 @@ def display_midcon_details(df_filtered, active_region, forecast_end: pd.Timestam
         st.info("No data available for the selected filters.")
         return
 
-    # Extend with forecast rows only up to the user-selected end date
     df_all = _extend_with_30d_forecast(df_filtered, id_col="System", forecast_end=forecast_end)
-
     df_display, cols = build_details_view(df_all, id_col="System")
 
     st.caption("Rows are editable. Use the 'source' column to distinguish system vs forecast vs manual.")
 
-    # One combined editable table.
     st.data_editor(
         df_display[cols],
         num_rows="dynamic",
@@ -311,7 +281,7 @@ def display_midcon_details(df_filtered, active_region, forecast_end: pd.Timestam
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def display_location_details(df_filtered, active_region, forecast_end: pd.Timestamp):
+def display_location_details(df_filtered: pd.DataFrame, active_region: str, forecast_end: pd.Timestamp):
     st.subheader("🏭 Locations")
 
     source_cfg = st.column_config.SelectboxColumn(
@@ -344,7 +314,6 @@ def display_location_details(df_filtered, active_region, forecast_end: pd.Timest
             if df_loc.empty:
                 st.write("*(No data for this location)*")
             else:
-                # Extend with forecast rows for this location only up to the user-selected end date
                 df_all = _extend_with_30d_forecast(df_loc, id_col="Location", forecast_end=forecast_end)
                 df_display, cols = build_details_view(df_all, id_col="Location")
 
@@ -367,13 +336,7 @@ def display_location_details(df_filtered, active_region, forecast_end: pd.Timest
             st.markdown("</div>", unsafe_allow_html=True)
 
 
-def display_details_tab(df_filtered, active_region, end_ts: pd.Timestamp):
-    """Details tab.
-
-    Forecast rows are generated only for missing days after the last available
-    date in the filtered dataset, up to `end_ts`.
-    """
-
+def display_details_tab(df_filtered: pd.DataFrame, active_region: str, end_ts: pd.Timestamp):
     if active_region == "Group Supply Report (Midcon)":
         display_midcon_details(df_filtered, active_region, forecast_end=end_ts)
     else:
