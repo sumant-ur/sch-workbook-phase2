@@ -3,6 +3,8 @@ import pandas as pd
 import numpy as np
 from datetime import timedelta
 
+from admin_config import get_visible_columns, get_threshold_overrides
+
 DETAILS_RENAME = {
     "Open Inv": "Opening Inv",
     "Batch In (RECEIPTS_BBL)": "Batch In",
@@ -406,6 +408,7 @@ def _extend_with_30d_forecast(
         for d in _forecast_dates(last_date, forecast_end, default_days):
             flows = estimate_forecast_flows(group, flow_cols=flow_cols, d=d)
             opening, closing = _roll_inventory(prev_close, flows, flow_cols)
+
             prev_close = closing
 
             row = {
@@ -449,6 +452,46 @@ def build_details_view(df: pd.DataFrame, id_col: str):
     return df, cols
 
 
+def _threshold_values(*, region: str, location: str | None) -> tuple[float | None, float | None]:
+    ovr = get_threshold_overrides(region=region, location=location)
+    bottom = ovr.get("BOTTOM")
+    safefill = ovr.get("SAFEFILL")
+    b = float(bottom) if bottom is not None and not pd.isna(bottom) else None
+    s = float(safefill) if safefill is not None and not pd.isna(safefill) else None
+    return b, s
+
+
+def _show_thresholds(*, region_label: str, bottom: float | None, safefill: float | None):
+    c0, c1, c2 = st.columns([5, 2, 2])
+
+    with c0:
+        st.markdown(f"### 📍 {region_label}")
+
+    with c1:
+        v = "—" if safefill is None else f"{safefill:,.0f}"
+        st.markdown(
+            f"""
+            <div class="mini-card">
+              <p class="label">SafeFill</p>
+              <p class="value">{v}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with c2:
+        v = "—" if bottom is None else f"{bottom:,.0f}"
+        st.markdown(
+            f"""
+            <div class="mini-card">
+              <p class="label">Bottom</p>
+              <p class="value">{v}</p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+
 def _build_editor_df(df_display: pd.DataFrame, *, id_col: str, ui_cols: list[str]) -> pd.DataFrame:
     """Return the dataframe we should keep in editor state.
 
@@ -479,11 +522,25 @@ def display_midcon_details(df_filtered: pd.DataFrame, active_region: str, foreca
     df_all = _extend_with_30d_forecast(df_filtered, id_col="System", forecast_end=forecast_end)
     df_display, cols = build_details_view(df_all, id_col="System")
 
+    scope_sys = None
+    if df_filtered is not None and not df_filtered.empty and "System" in df_filtered.columns:
+        systems = sorted(df_filtered["System"].dropna().unique().tolist())
+        if len(systems) == 1:
+            scope_sys = systems[0]
+
+    bottom, safefill = _threshold_values(region=active_region, location=str(scope_sys) if scope_sys is not None else None)
+    _show_thresholds(region_label=active_region, bottom=bottom, safefill=safefill)
+
+    visible = get_visible_columns(region=active_region, location=str(scope_sys) if scope_sys is not None else None)
+    must_have = ["Date", "System", "Product", "Opening Inv", "Close Inv"]
+    column_order = []
+    for c in must_have + visible:
+        if c in cols and c not in column_order and c != "source":
+            column_order.append(c)
+
     locked_cols = _locked_cols("System", cols)
     column_config = _column_config(df_display, cols, "System")
 
-    # Hide internal lineage columns from the UI.
-    column_order = [c for c in cols if c != "source"]
     column_config = {k: v for k, v in column_config.items() if k in column_order}
 
     # Ensure we have a RangeIndex so `hide_index=True` works with `num_rows='dynamic'`.
@@ -541,7 +598,7 @@ def display_location_details(df_filtered: pd.DataFrame, active_region: str, fore
 
     for i, loc in enumerate(st.tabs(region_locs)):
         with loc:
-            st.markdown(f"### 📍 {region_locs[i]}")
+            # st.markdown(f"### 📍 {region_locs[i]}")
             df_loc = df_filtered[df_filtered["Location"] == region_locs[i]]
 
             if df_loc.empty:
@@ -550,11 +607,19 @@ def display_location_details(df_filtered: pd.DataFrame, active_region: str, fore
                 df_all = _extend_with_30d_forecast(df_loc, id_col="Location", forecast_end=forecast_end)
                 df_display, cols = build_details_view(df_all, id_col="Location")
 
+                bottom, safefill = _threshold_values(region=active_region, location=str(region_locs[i]))
+                _show_thresholds(region_label=str(region_locs[i]), bottom=bottom, safefill=safefill)
+
+                visible = get_visible_columns(region=active_region, location=str(region_locs[i]))
+                must_have = ["Date", "Location", "Product", "Opening Inv", "Close Inv"]
+                column_order = []
+                for c in must_have + visible:
+                    if c in cols and c not in column_order and c != "source":
+                        column_order.append(c)
+
                 locked_cols = _locked_cols("Location", cols)
                 column_config = _column_config(df_display, cols, "Location")
 
-                # Hide internal lineage columns from the UI.
-                column_order = [c for c in cols if c != "source"]
                 column_config = {k: v for k, v in column_config.items() if k in column_order}
 
                 # Ensure we have a RangeIndex so `hide_index=True` works with `num_rows='dynamic'`.

@@ -68,6 +68,28 @@ def apply_custom_css():
         box-shadow: 0 2px 6px rgba(0,0,0,0.08);
         margin-bottom: 0.6rem;
     }}
+
+    .mini-card {{
+        background-color: {CARD_BG};
+        padding: 0.5rem 0.75rem;
+        border-radius: 10px;
+        box-shadow: 0 2px 6px rgba(0,0,0,0.08);
+        border-left: 4px solid {ACCENT_GREEN};
+        line-height: 1.1;
+    }}
+    .mini-card .label {{
+        font-size: 0.8rem;
+        font-weight: 700;
+        color: {TEXT_DARK};
+        opacity: 0.8;
+        margin: 0;
+    }}
+    .mini-card .value {{
+        font-size: 1.1rem;
+        font-weight: 800;
+        color: {PRIMARY_BLUE};
+        margin: 0.15rem 0 0 0;
+    }}
     </style>
     """
     st.markdown(css_style, unsafe_allow_html=True)

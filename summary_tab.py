@@ -6,6 +6,8 @@ Contains all logic and display components for the Regional Summary tab
 import streamlit as st
 import pandas as pd
 import numpy as np
+
+from admin_config import get_threshold_overrides
 from config import (
     REQUIRED_MAX_DEFAULTS,
     REQUIRED_MIN_DEFAULTS,
@@ -16,84 +18,79 @@ from config import (
 )
 
 
-def calculate_required_max(row, group_cols, df_filtered):
-    """Calculate required max based on historical data or defaults."""
-    # Use Tank Capacity * 0.85 as required max, or fall back to default
-    if group_cols[0] == "System":
-        key = f"{row['System']}|{row['Product']}"
-        prod_key = row['Product']
-    else:
-        key = f"{row['Location']}|{row['Product']}"
-        prod_key = row['Product']
+def _normalize_region(active_region: str) -> str:
+    return "Midcon" if active_region == "Group Supply Report (Midcon)" else active_region
 
+
+def _is_midcon(active_region: str) -> bool:
+    return _normalize_region(active_region) == "Midcon"
+
+
+def calculate_required_max(row, group_cols, df_filtered):
+    region = str(row.get("Region") or "Unknown")
+    loc_or_sys = row.get(group_cols[0])
+    overrides = get_threshold_overrides(region=_normalize_region(region), location=str(loc_or_sys) if pd.notna(loc_or_sys) else None)
+
+    safefill = overrides.get("SAFEFILL")
+    if safefill is not None and not pd.isna(safefill):
+        return float(safefill)
+
+    prod = str(row.get("Product") or "")
+    key = f"{loc_or_sys}|{prod}"
     if key in REQUIRED_MAX_DEFAULTS:
-        return REQUIRED_MAX_DEFAULTS[key]
-    elif prod_key in REQUIRED_MAX_DEFAULTS:
-        return REQUIRED_MAX_DEFAULTS[prod_key]
-    else:
-        # Calculate based on tank capacity if available
-        tank_cap_data = df_filtered[
+        return float(REQUIRED_MAX_DEFAULTS[key])
+    if prod in REQUIRED_MAX_DEFAULTS:
+        return float(REQUIRED_MAX_DEFAULTS[prod])
+
+    if "Safe Fill Limit" in df_filtered.columns and group_cols[0] in df_filtered.columns:
+        safe_fill = df_filtered[
             (df_filtered[group_cols[0]] == row[group_cols[0]]) &
             (df_filtered["Product"] == row["Product"])
-        ]["Tank Capacity"].max()
+        ]["Safe Fill Limit"].max()
+        if pd.notna(safe_fill) and safe_fill > 0:
+            return float(safe_fill)
 
-        if pd.notna(tank_cap_data) and tank_cap_data > 0:
-            return tank_cap_data * 0.85
-        else:
-            return GLOBAL_REQUIRED_MAX_FALLBACK
+    return float(GLOBAL_REQUIRED_MAX_FALLBACK)
 
 
 def calculate_intransit(row, group_cols, df_filtered):
     """Calculate intransit based on pipeline data or defaults."""
-    # Use Pipeline In data or defaults
     if group_cols[0] == "System":
         key = f"{row['System']}|{row['Product']}"
         prod_key = row["Product"]
     else:
         key = f"{row['Location']}|{row['Product']}"
         prod_key = row["Product"]
+
+    pipeline_val = row.get("Pipeline In", 0)
+    if pd.notna(pipeline_val) and pipeline_val > 0:
+        return float(pipeline_val)
 
     if key in INTRANSIT_DEFAULTS:
         return INTRANSIT_DEFAULTS[key]
     if prod_key in INTRANSIT_DEFAULTS:
         return INTRANSIT_DEFAULTS[prod_key]
 
-    # Use average pipeline in as intransit estimate
-    pipeline_data = df_filtered[
-        (df_filtered[group_cols[0]] == row[group_cols[0]]) &
-        (df_filtered["Product"] == row["Product"])
-    ]["Pipeline In"].mean()
-
-    if pd.notna(pipeline_data) and pipeline_data > 0:
-        return pipeline_data
-
     return GLOBAL_INTRANSIT_FALLBACK
 
 
 def calculate_required_min(row, group_cols, df_filtered):
-    """Calculate required minimum based on historical data or defaults."""
-    if group_cols[0] == "System":
-        key = f"{row['System']}|{row['Product']}"
-        prod_key = row["Product"]
-    else:
-        key = f"{row['Location']}|{row['Product']}"
-        prod_key = row["Product"]
+    region = str(row.get("Region") or "Unknown")
+    loc_or_sys = row.get(group_cols[0])
+    overrides = get_threshold_overrides(region=_normalize_region(region), location=str(loc_or_sys) if pd.notna(loc_or_sys) else None)
 
+    bottom = overrides.get("BOTTOM")
+    if bottom is not None and not pd.isna(bottom):
+        return float(bottom)
+
+    prod = str(row.get("Product") or "")
+    key = f"{loc_or_sys}|{prod}"
     if key in REQUIRED_MIN_DEFAULTS:
-        return REQUIRED_MIN_DEFAULTS[key]
-    if prod_key in REQUIRED_MIN_DEFAULTS:
-        return REQUIRED_MIN_DEFAULTS[prod_key]
+        return float(REQUIRED_MIN_DEFAULTS[key])
+    if prod in REQUIRED_MIN_DEFAULTS:
+        return float(REQUIRED_MIN_DEFAULTS[prod])
 
-    # Calculate based on tank capacity if available
-    tank_cap = df_filtered[
-        (df_filtered[group_cols[0]] == row[group_cols[0]]) &
-        (df_filtered["Product"] == row["Product"])
-    ]["Tank Capacity"].max()
-
-    if pd.notna(tank_cap) and tank_cap > 0:
-        return tank_cap * 0.15
-
-    return GLOBAL_REQUIRED_MIN_FALLBACK
+    return float(GLOBAL_REQUIRED_MIN_FALLBACK)
 
 
 def display_regional_summary(df_filtered, active_region):
@@ -106,10 +103,10 @@ def display_regional_summary(df_filtered, active_region):
 
     # Determine sales column
     sales_cols = [c for c in ["Rack/Liftings", "Batch Out (DELIVERIES_BBL)"] if c in df_filtered.columns]
-    sales_col = sales_cols[0] if sales_cols else None
+    region_name = _normalize_region(active_region)
 
     # Group by Location/System and Product
-    if active_region == "Midcon":
+    if _is_midcon(active_region):
         group_cols = ["System", "Product"]
     else:
         group_cols = ["Location", "Product"]
@@ -137,7 +134,7 @@ def display_regional_summary(df_filtered, active_region):
         })
     )
 
-    daily["Sales"] = daily[sales_col] if sales_col else 0
+    daily["Sales"] = daily[sales_cols].sum(axis=1) if sales_cols else 0
 
     # Get latest date metrics
     if daily.empty:
@@ -177,18 +174,20 @@ def display_regional_summary(df_filtered, active_region):
 
     # Build summary DataFrame
     summary_df = (
-        latest[group_cols + ["Close Inv"]]
+        latest[group_cols + ["Close Inv", "Pipeline In"]]
         .merge(pds, on=group_cols, how="left")
         .merge(seven_day, on=group_cols, how="left")
     )
 
-    # Calculate Required Min/Max and In-Transit
-    summary_df["Required Maximum"] = summary_df.apply(
+    summary_df["Region"] = region_name
+
+    # Calculate thresholds and in-transit
+    summary_df["SafeFill"] = summary_df.apply(
         lambda row: calculate_required_max(row, group_cols, df_filtered),
         axis=1,
     ).astype(float)
 
-    summary_df["Required Minimum"] = summary_df.apply(
+    summary_df["Bottom"] = summary_df.apply(
         lambda row: calculate_required_min(row, group_cols, df_filtered),
         axis=1,
     ).astype(float)
@@ -204,18 +203,17 @@ def display_regional_summary(df_filtered, active_region):
         summary_df["Gross Inventory"] + summary_df["In-Transit"].fillna(0)
     ).astype(float)
 
-    summary_df["Available Net Inventory"] = (
-        summary_df["Total Inventory"] - summary_df["Required Minimum"].fillna(0)
-    ).astype(float)
+    # Net Inventory = Gross - Required Min (Heels)
+    summary_df["Available Net Inventory"] = (summary_df["Gross Inventory"] - summary_df["Bottom"].fillna(0)).astype(float)
 
-    # Days supply calculation
+    # Days supply calculation: Net Inventory / 7 Day Avg
     sda = summary_df["Seven_Day_Avg_Sales"].replace({0: np.nan})
     summary_df["Number days' Supply"] = (
-        summary_df["Total Inventory"] / sda
+        summary_df["Available Net Inventory"] / sda
     ).replace([np.inf, -np.inf], np.nan)
 
     # Display formatting
-    if active_region == "Midcon":
+    if _is_midcon(active_region):
         display_df = summary_df.copy()
         display_df["Location"] = display_df["System"]
     else:
@@ -235,8 +233,8 @@ def display_regional_summary(df_filtered, active_region):
         "Prior Day Sales",
         "7 Day Average",
         "Number days' Supply",
-        "Required Minimum",
-        "Required Maximum",
+        "Bottom",
+        "SafeFill",
         "In-Transit",
         "Gross Inventory",
         "Total Inventory",
@@ -259,7 +257,7 @@ def display_forecast_table(df_filtered, active_region):
         return
 
     # Determine group columns based on region
-    if active_region == "Midcon":
+    if _is_midcon(active_region):
         group_cols = ["System", "Product"]
     else:
         group_cols = ["Location", "Product"]

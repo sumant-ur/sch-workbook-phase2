@@ -7,6 +7,8 @@ import streamlit as st
 import pandas as pd
 from datetime import timedelta, date
 
+from admin_config import get_default_date_window
+
 
 def create_sidebar_filters(regions, df_region):
     """Create and manage sidebar filters."""
@@ -20,15 +22,23 @@ def create_sidebar_filters(regions, df_region):
         active_region = None
         st.sidebar.warning("No regions available")
 
-    # Date range selector
-    # Default should be: last 10 days through next 30 days (from today)
-    today = date.today()
-    default_start = today - timedelta(days=10)
-    default_end = today + timedelta(days=30)
+    loc_col = "System" if active_region == "Midcon" else "Location"
+    filter_label = "🏭 System" if active_region == "Midcon" else "📍 Location"
+    locations = sorted(df_region[loc_col].dropna().unique().tolist()) if loc_col in df_region.columns and not df_region.empty else []
 
-    # Keep the picker bounds wide enough to include both:
-    # - the dataset min/max (when available)
-    # - the desired default window (today-10 .. today+30)
+    selected_locs = st.sidebar.multiselect(
+        filter_label,
+        options=locations,
+        default=locations[:5] if len(locations) > 5 else locations
+    )
+
+    # Date range selector
+    today = date.today()
+    scope_location = selected_locs[0] if len(selected_locs) == 1 else None
+    start_off, end_off = get_default_date_window(region=active_region or "Unknown", location=scope_location)
+    default_start = today + timedelta(days=int(start_off))
+    default_end = today + timedelta(days=int(end_off))
+
     if not df_region.empty and "Date" in df_region.columns:
         df_min = df_region["Date"].min()
         df_max = df_region["Date"].max()
@@ -46,10 +56,9 @@ def create_sidebar_filters(regions, df_region):
         value=(default_start, default_end),
         min_value=min_value,
         max_value=max_value,
-        key=f"date_{active_region}"
+        key=f"date_{active_region}_{scope_location or 'all'}"
     )
 
-    # Handle date input format
     if isinstance(date_range, (list, tuple)):
         if len(date_range) == 2:
             start_date, end_date = date_range
@@ -60,23 +69,8 @@ def create_sidebar_filters(regions, df_region):
 
     start_ts, end_ts = pd.to_datetime(start_date), pd.to_datetime(end_date)
 
-    # Location/System filter
-    locations = sorted(df_region["Location"].dropna().unique().tolist()) if "Location" in df_region.columns and not df_region.empty else []
-
-    # Change filter label based on region
-    if active_region == "Midcon":
-        filter_label = "🏭 System"
-    else:
-        filter_label = "📍 Location"
-
-    selected_locs = st.sidebar.multiselect(
-        filter_label,
-        options=locations,
-        default=locations[:5] if len(locations) > 5 else locations
-    )
-
     # Product filter
-    subset = df_region[df_region["Location"].isin(selected_locs)] if selected_locs else df_region
+    subset = df_region[df_region[loc_col].isin(selected_locs)] if selected_locs else df_region
     products = sorted(subset["Product"].dropna().unique().tolist()) if "Product" in subset.columns and not subset.empty else []
     selected_prods = st.sidebar.multiselect(
         "🧪 Product",
@@ -90,6 +84,7 @@ def create_sidebar_filters(regions, df_region):
         "end_ts": end_ts,
         "selected_locs": selected_locs,
         "selected_prods": selected_prods,
+        "loc_col": loc_col,
         "locations": locations,
         "products": products
     }
@@ -108,10 +103,11 @@ def apply_filters(df_region, filters):
         (df_filtered["Date"] <= filters["end_ts"])
     ]
 
-    # Apply location filter
-    if filters["selected_locs"] and "Location" in df_filtered.columns:
+    # Apply location/system filter
+    loc_col = filters.get("loc_col", "Location")
+    if filters["selected_locs"] and loc_col in df_filtered.columns:
         if len(filters["selected_locs"]) < len(filters["locations"]):
-            df_filtered = df_filtered[df_filtered["Location"].isin(filters["selected_locs"])]
+            df_filtered = df_filtered[df_filtered[loc_col].isin(filters["selected_locs"])]
 
     # Apply product filter
     if filters["selected_prods"] and "Product" in df_filtered.columns:

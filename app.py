@@ -12,6 +12,7 @@ from data_loader import initialize_data, ensure_numeric_columns
 from sidebar_filters import create_sidebar_filters, apply_filters
 from summary_tab import display_regional_summary, display_forecast_table
 from details_tab import display_details_tab
+from admin_panel import display_super_admin_panel
 
 
 def main():
@@ -24,6 +25,9 @@ def main():
 
     # Initialize data
     regions = initialize_data()
+
+    if "admin_view" not in st.session_state:
+        st.session_state.admin_view = False
 
     # Ensure we have regions loaded
     if "regions" not in st.session_state:
@@ -41,9 +45,23 @@ def main():
         active_region = None
         df_region = pd.DataFrame()
 
+    if st.session_state.admin_view:
+        st.sidebar.button("⬅️ Back", key="admin_back", on_click=lambda: st.session_state.update({"admin_view": False}))
+        display_super_admin_panel(
+            regions=regions,
+            active_region=active_region,
+            all_data=st.session_state.get("all_data", pd.DataFrame()),
+        )
+        return
+
     # Create sidebar filters
     filters = create_sidebar_filters(regions, df_region)
     active_region = filters["active_region"]
+
+    st.sidebar.markdown("---")
+    if st.sidebar.button("🛠️ Super Admin Config", key="admin_open"):
+        st.session_state.admin_view = True
+        st.rerun()
 
     # Update region data based on selected region
     if active_region:
