@@ -6,6 +6,7 @@ Contains all logic and display components for the Regional Summary tab
 import streamlit as st
 import pandas as pd
 import numpy as np
+import datetime
 
 from admin_config import get_threshold_overrides
 from config import (
@@ -266,7 +267,16 @@ def display_forecast_table(df_filtered, active_region):
         st.info("No forecast data available for the selected filters.")
         return
 
-    # Generate forecast data based on actual data
+    today = datetime.date.today()
+    last_month_end = today.replace(day=1) - datetime.timedelta(days=1)
+
+    if today.month == 12:
+        next_month_start = today.replace(year=today.year + 1, month=1, day=1)
+    else:
+        next_month_start = today.replace(month=today.month + 1, day=1)
+    curr_month_end = next_month_start - datetime.timedelta(days=1)
+
+    # Generate forecast data
     forecast_data = []
 
     # Get unique combinations
@@ -274,21 +284,31 @@ def display_forecast_table(df_filtered, active_region):
     unique_combos = unique_combos.head(6)  # Limit to first 6 for display
 
     for _, row in unique_combos.iterrows():
-        # Calculate forecasts based on historical data
         loc_prod_data = df_filtered[
             (df_filtered[group_cols[0]] == row[group_cols[0]]) &
             (df_filtered["Product"] == row["Product"])
         ]
 
-        current_inv = loc_prod_data["Close Inv"].iloc[-1] if not loc_prod_data.empty else 0
-        avg_daily_change = loc_prod_data["Close Inv"].diff().mean() if len(loc_prod_data) > 1 else 100
+        beg_inv_row = loc_prod_data[loc_prod_data["Date"].dt.date == last_month_end]
+        if not beg_inv_row.empty:
+            beginning_inv = beg_inv_row["Close Inv"].iloc[0]
+        else:
+            beginning_inv = 0
+
+        proj_inv_row = loc_prod_data[loc_prod_data["Date"].dt.date == curr_month_end]
+        if not proj_inv_row.empty:
+            projected_eom = proj_inv_row["Close Inv"].iloc[0]
+        else:
+            projected_eom = 0
+
+        build_draw = projected_eom - beginning_inv
 
         forecast_row = {
             group_cols[0]: row[group_cols[0]],
             "Product": row["Product"],
-            "Beginning inventory": round(current_inv, 0),
-            "Projected EOM": round(current_inv + (avg_daily_change * 30), 0),
-            "Build/Draw": round(avg_daily_change * 30, 0),
+            "Beginning inventory": round(beginning_inv, 0),
+            "Projected EOM": round(projected_eom, 0),
+            "Build/Draw": round(build_draw, 0),
         }
         forecast_data.append(forecast_row)
 
