@@ -26,10 +26,14 @@ def create_sidebar_filters(regions, df_region):
     filter_label = "🏭 System" if active_region == "Midcon" else "📍 Location"
     locations = sorted(df_region[loc_col].dropna().unique().tolist()) if loc_col in df_region.columns and not df_region.empty else []
 
+    # Default to *all* locations. Limiting defaults can make certain location tabs
+    # appear/disappear in confusing ways when other filters (like Product) are also
+    # constrained.
     selected_locs = st.sidebar.multiselect(
         filter_label,
         options=locations,
-        default=locations[:5] if len(locations) > 5 else locations
+        default=locations,
+        key="selected_locs",
     )
 
     # Date range selector
@@ -72,10 +76,14 @@ def create_sidebar_filters(regions, df_region):
     # Product filter
     subset = df_region[df_region[loc_col].isin(selected_locs)] if selected_locs else df_region
     products = sorted(subset["Product"].dropna().unique().tolist()) if "Product" in subset.columns and not subset.empty else []
+    # Default to *all* products. If we only preselect the first N products, locations
+    # whose data exists only for non-selected products will disappear from the Details
+    # tabs (because df_filtered becomes empty for those locations).
     selected_prods = st.sidebar.multiselect(
         "🧪 Product",
         options=products,
-        default=products[:5] if len(products) > 5 else products
+        default=products,
+        key="selected_prods",
     )
 
     return {

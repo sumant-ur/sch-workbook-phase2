@@ -590,7 +590,14 @@ def display_location_details(df_filtered: pd.DataFrame, active_region: str, fore
         st.info("No data available for the selected filters.")
         return
 
-    region_locs = sorted(df_filtered["Location"].dropna().unique().tolist()) if "Location" in df_filtered.columns else []
+    # Prefer the user-selected locations from the sidebar (when available) so that
+    # a location tab doesn't “disappear” simply because other filters (like Product)
+    # result in no rows for that location.
+    selected_locs = st.session_state.get("selected_locs")
+    if isinstance(selected_locs, (list, tuple)) and len(selected_locs):
+        region_locs = [str(x) for x in selected_locs]
+    else:
+        region_locs = sorted(df_filtered["Location"].dropna().unique().tolist()) if "Location" in df_filtered.columns else []
 
     if not region_locs:
         st.write("*(No locations available in the current selection)*")
