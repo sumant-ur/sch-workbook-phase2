@@ -13,8 +13,8 @@ DETAILS_RENAME = {
 DETAILS_COLS = [
     "source",
     "Product",
-    "Close Inv",
     "Opening Inv",
+    "Close Inv",
     "Batch In",
     "Batch Out",
     "Rack/Lifting",
@@ -77,6 +77,26 @@ DETAILS_EDITOR_HEADER_PX = 35
 DETAILS_EDITOR_HEIGHT_PX = DETAILS_EDITOR_HEADER_PX + (DETAILS_EDITOR_VISIBLE_ROWS * DETAILS_EDITOR_ROW_PX)
 
 
+# Flow-column names *after* `DETAILS_RENAME` has been applied.
+DISPLAY_INFLOW_COLS = [
+    "Batch In",
+    "Pipeline In",
+    "Production",
+]
+
+DISPLAY_OUTFLOW_COLS = [
+    "Batch Out",
+    "Rack/Lifting",
+    "Pipeline Out",
+]
+
+DISPLAY_NET_COLS = [
+    "Adjustments",
+    "Gain/Loss",
+    "Transfers",
+]
+
+
 def _style_source_cells(df: pd.DataFrame, cols_to_color: list[str]) -> "pd.io.formats.style.Styler":
     cols = list(df.columns)
     cols_set = set(cols_to_color)
@@ -87,6 +107,115 @@ def _style_source_cells(df: pd.DataFrame, cols_to_color: list[str]) -> "pd.io.fo
         return [style if (c in cols_set and style) else "" for c in cols]
 
     return df.style.apply(_row_style, axis=1).hide(axis="index")
+
+
+def _to_float(x) -> float:
+    try:
+        if x is None or (isinstance(x, float) and pd.isna(x)):
+            return 0.0
+        return float(x)
+    except Exception:
+        return 0.0
+
+
+def _sum_row(row: pd.Series, cols: list[str]) -> float:
+    return float(sum(_to_float(row.get(c, 0.0)) for c in cols if c in row.index))
+
+
+def _recalculate_open_close_inv(df: pd.DataFrame, *, id_col: str) -> pd.DataFrame:
+    """Recompute Opening/Close inventory based on editable flow columns.
+
+    Streamlit's `st.data_editor` triggers a rerun on every edit. By recomputing
+    the derived columns and then rerunning once more, users see Opening/Close
+    update “live” as they change flows like Rack/Lifting, Batch In, etc.
+
+    Rules:
+    - Compute sequentially per (id_col, Product) ordered by Date.
+    - First row keeps its existing Opening Inv (or 0.0 if missing).
+    - Subsequent rows: Opening Inv := previous row's computed Close Inv.
+    - Close Inv := Opening + inflow - outflow + net.
+    """
+    if df is None or df.empty:
+        return df
+
+    out = df.copy()
+
+    # Work with datetimes internally for stable sorting; convert back to date at end.
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce")
+
+    numeric_candidates = [
+        "Opening Inv",
+        "Close Inv",
+        *DISPLAY_INFLOW_COLS,
+        *DISPLAY_OUTFLOW_COLS,
+        *DISPLAY_NET_COLS,
+    ]
+    for c in numeric_candidates:
+        if c in out.columns:
+            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+
+    group_cols = [id_col]
+    if "Product" in out.columns:
+        group_cols.append("Product")
+
+    # Stable sort so we don't get UI flicker when other columns tie.
+    sort_cols = ["Date"] + group_cols
+    out = out.sort_values(sort_cols, kind="mergesort")
+
+    def _apply(g: pd.DataFrame) -> pd.DataFrame:
+        g = g.sort_values("Date", kind="mergesort").copy()
+        prev_close = 0.0
+
+        for i, idx in enumerate(g.index):
+            if i == 0:
+                opening = _to_float(g.at[idx, "Opening Inv"]) if "Opening Inv" in g.columns else 0.0
+            else:
+                opening = prev_close
+
+            inflow = _sum_row(g.loc[idx], DISPLAY_INFLOW_COLS)
+            outflow = _sum_row(g.loc[idx], DISPLAY_OUTFLOW_COLS)
+            net = _sum_row(g.loc[idx], DISPLAY_NET_COLS)
+            close = float(opening + inflow - outflow + net)
+
+            if "Opening Inv" in g.columns:
+                g.at[idx, "Opening Inv"] = opening
+            if "Close Inv" in g.columns:
+                g.at[idx, "Close Inv"] = close
+
+            prev_close = close
+
+        return g
+
+    out = out.groupby(group_cols, dropna=False, group_keys=False).apply(_apply)
+
+    # Make sure the UI sees date-only values.
+    out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.date
+
+    # Keep numbers tidy for display.
+    for c in out.columns:
+        if c in {"updated"}:
+            continue
+        if pd.api.types.is_numeric_dtype(out[c]):
+            out[c] = out[c].round(2)
+
+    return out
+
+
+def _needs_inventory_rerun(before: pd.DataFrame, after: pd.DataFrame) -> bool:
+    """Return True if Opening/Close differ between two dfs (shape-safe)."""
+    if before is None or after is None:
+        return False
+    if before.shape[0] != after.shape[0]:
+        return True
+
+    for c in ["Opening Inv", "Close Inv"]:
+        if c not in before.columns or c not in after.columns:
+            continue
+        b = pd.to_numeric(before[c], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        a = pd.to_numeric(after[c], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        if not np.allclose(a, b, rtol=0, atol=1e-9):
+            return True
+    return False
 
 
 def _locked_cols(id_col: str, cols: list[str]) -> list[str]:
@@ -320,6 +449,26 @@ def build_details_view(df: pd.DataFrame, id_col: str):
     return df, cols
 
 
+def _build_editor_df(df_display: pd.DataFrame, *, id_col: str, ui_cols: list[str]) -> pd.DataFrame:
+    """Return the dataframe we should keep in editor state.
+
+    We intentionally keep *extra* flow columns (like Production/Adjustments)
+    even if they aren't shown in `DETAILS_COLS`, so inventory math remains
+    consistent.
+    """
+    extra = [
+        "Production",
+        "Adjustments",
+    ]
+    # Always keep columns required for grouping + lineage.
+    base = ["Date", id_col, "source", "Product", "updated", "Notes", "Opening Inv", "Close Inv"]
+    desired = []
+    for c in base + ui_cols + extra:
+        if c in df_display.columns and c not in desired:
+            desired.append(c)
+    return df_display[desired].reset_index(drop=True)
+
+
 def display_midcon_details(df_filtered: pd.DataFrame, active_region: str, forecast_end: pd.Timestamp):
     st.subheader("🧾 Group Daily Details")
 
@@ -338,18 +487,38 @@ def display_midcon_details(df_filtered: pd.DataFrame, active_region: str, foreca
     column_config = {k: v for k, v in column_config.items() if k in column_order}
 
     # Ensure we have a RangeIndex so `hide_index=True` works with `num_rows='dynamic'`.
-    editor_df = df_display[cols].reset_index(drop=True)
+    base_key = f"{active_region}_edit"
+    df_key = f"{base_key}__df"
+    ver_key = f"{base_key}__ver"
+    widget_key = f"{base_key}__v{int(st.session_state.get(ver_key, 0))}"
 
-    st.data_editor(
-        _style_source_cells(editor_df, locked_cols),
+    editor_df = _build_editor_df(df_display, id_col="System", ui_cols=cols)
+
+    # Keep editor state across reruns so we can push computed column updates back in.
+    if df_key not in st.session_state or list(st.session_state[df_key].columns) != list(editor_df.columns):
+        st.session_state[df_key] = _recalculate_open_close_inv(editor_df, id_col="System")
+
+    styled = _style_source_cells(st.session_state[df_key], locked_cols)
+
+    edited = st.data_editor(
+        styled,
         num_rows="dynamic",
         width="stretch",
         height=DETAILS_EDITOR_HEIGHT_PX,
         hide_index=True,
         column_order=column_order,
-        key=f"{active_region}_edit",
+        key=widget_key,
         column_config=column_config,
     )
+
+    # Recompute derived inventory columns based on the just-edited flows.
+    recomputed = _recalculate_open_close_inv(edited, id_col="System")
+    st.session_state[df_key] = recomputed
+
+    # Force one extra rerun so the editor repaints with the new Opening/Close values.
+    if _needs_inventory_rerun(edited, recomputed):
+        st.session_state[ver_key] = int(st.session_state.get(ver_key, 0)) + 1
+        st.rerun()
 
     st.markdown('<div class="save-btn-bottom">', unsafe_allow_html=True)
     if st.button("💾 Save Changes", key=f"save_{active_region}"):
@@ -389,18 +558,34 @@ def display_location_details(df_filtered: pd.DataFrame, active_region: str, fore
                 column_config = {k: v for k, v in column_config.items() if k in column_order}
 
                 # Ensure we have a RangeIndex so `hide_index=True` works with `num_rows='dynamic'`.
-                editor_df = df_display[cols].reset_index(drop=True)
+                base_key = f"{active_region}_{region_locs[i]}_edit"
+                df_key = f"{base_key}__df"
+                ver_key = f"{base_key}__ver"
+                widget_key = f"{base_key}__v{int(st.session_state.get(ver_key, 0))}"
 
-                st.data_editor(
-                    _style_source_cells(editor_df, locked_cols),
+                editor_df = _build_editor_df(df_display, id_col="Location", ui_cols=cols)
+
+                if df_key not in st.session_state or list(st.session_state[df_key].columns) != list(editor_df.columns):
+                    st.session_state[df_key] = _recalculate_open_close_inv(editor_df, id_col="Location")
+
+                styled = _style_source_cells(st.session_state[df_key], locked_cols)
+
+                edited = st.data_editor(
+                    styled,
                     num_rows="dynamic",
                     width="stretch",
                     height=DETAILS_EDITOR_HEIGHT_PX,
                     hide_index=True,
                     column_order=column_order,
-                    key=f"{active_region}_{region_locs[i]}_edit",
+                    key=widget_key,
                     column_config=column_config,
                 )
+
+                recomputed = _recalculate_open_close_inv(edited, id_col="Location")
+                st.session_state[df_key] = recomputed
+                if _needs_inventory_rerun(edited, recomputed):
+                    st.session_state[ver_key] = int(st.session_state.get(ver_key, 0)) + 1
+                    st.rerun()
 
             st.markdown('<div class="save-btn-bottom">', unsafe_allow_html=True)
             if st.button(f"💾 Save {region_locs[i]}", key=f"save_{active_region}_{region_locs[i]}"):
