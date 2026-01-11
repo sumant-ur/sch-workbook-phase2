@@ -6,8 +6,14 @@ from dataclasses import dataclass
 import pandas as pd
 import streamlit as st
 
-from config import SQLITE_ADMIN_CONFIG_TABLE, SNOWFLAKE_ADMIN_CONFIG_TABLE
-from data_loader import DATA_SOURCE, SQLITE_DB_PATH, SNOWFLAKE_WAREHOUSE, get_snowflake_session
+from config import (
+    SQLITE_ADMIN_CONFIG_TABLE,
+    SNOWFLAKE_ADMIN_CONFIG_TABLE,
+    DATA_SOURCE,
+    SQLITE_DB_PATH,
+    SNOWFLAKE_WAREHOUSE,
+)
+from data_loader import get_snowflake_session, load_region_location_pairs
 
 
 def _to_float_or_none(x):
@@ -282,7 +288,7 @@ def get_threshold_overrides(*, region: str, location: str | None) -> dict:
     }
 
 
-def display_super_admin_panel(*, regions: list[str], active_region: str | None, all_data: pd.DataFrame):
+def display_super_admin_panel(*, regions: list[str], active_region: str | None, all_data: pd.DataFrame | None = None):
     """Streamlit UI for super-admin configuration.
 
     Note: This used to live in `admin_panel.py` but was moved here so the admin
@@ -297,9 +303,15 @@ def display_super_admin_panel(*, regions: list[str], active_region: str | None, 
         index=(regions.index(active_region) if active_region in (regions or []) else 0),
     )
 
+    # We no longer preload the full inventory table. Use a small distinct query.
     locs: list[str] = []
-    if all_data is not None and not all_data.empty and "Region" in all_data.columns and "Location" in all_data.columns:
-        locs = sorted(all_data[all_data["Region"] == region]["Location"].dropna().unique().tolist())
+    try:
+        pairs = load_region_location_pairs()
+        if pairs is not None and not pairs.empty and "Region" in pairs.columns and "Location" in pairs.columns:
+            locs = sorted(pairs[pairs["Region"] == region]["Location"].dropna().astype(str).unique().tolist())
+    except Exception:
+        # Admin UI should still load even if query fails.
+        locs = []
 
     scope_opts = ["(Region default)"] + locs
     scope = st.selectbox("Location (optional)", options=scope_opts)

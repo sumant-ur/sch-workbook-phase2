@@ -1,33 +1,59 @@
 from __future__ import annotations
 
+"""Data loading + sidebar filters.
+
+Performance goal: do not load the full inventory table on page load.
+We load only lightweight metadata (regions, location list, date bounds) until the
+user submits filters.
+
+Note: we intentionally avoid importing `admin_config` at module import time to
+prevent circular imports (admin_config imports data_loader).
+"""
+
 import pandas as pd
 import streamlit as st
 
-from config import RAW_INVENTORY_TABLE
+from datetime import date, timedelta
 
-DATA_SOURCE = "sqlite"  # "snowflake"
-SQLITE_DB_PATH = "inventory.db"
-# Local dev SQLite table name
-SQLITE_TABLE = "APP_INVENTORY"
-SQLITE_SOURCE_STATUS_TABLE = "APP_SOURCE_STATUS"
-SNOWFLAKE_WAREHOUSE = "HFS_ADHOC_WH"
-SNOWFLAKE_SOURCE_STATUS_TABLE = "CONSUMPTION.HFS_COMMERCIAL_INVENTORY.APP_SOURCE_STATUS"
+from config import (
+    DATA_SOURCE,
+    SQLITE_DB_PATH,
+    SQLITE_TABLE,
+    SQLITE_SOURCE_STATUS_TABLE,
+    SNOWFLAKE_WAREHOUSE,
+    SNOWFLAKE_SOURCE_STATUS_TABLE,
+    RAW_INVENTORY_TABLE,
+    COL_ADJUSTMENTS,
+    COL_AVAILABLE_SPACE,
+    COL_BATCH_IN_RAW,
+    COL_BATCH_OUT_RAW,
+    COL_CLOSE_INV_RAW,
+    COL_GAIN_LOSS,
+    COL_OPEN_INV_RAW,
+    COL_PIPELINE_IN,
+    COL_PIPELINE_OUT,
+    COL_PRODUCTION,
+    COL_RACK_LIFTINGS_RAW,
+    COL_SAFE_FILL_LIMIT,
+    COL_TANK_CAPACITY,
+    COL_TRANSFERS,
+)
 
 NUMERIC_COLUMN_MAP = {
-    "Batch In (RECEIPTS_BBL)": "RECEIPTS_BBL",
-    "Batch Out (DELIVERIES_BBL)": "DELIVERIES_BBL",
-    "Rack/Liftings": "RACK_LIFTINGS_BBL",
-    "Close Inv": "CLOSING_INVENTORY_BBL",
-    "Open Inv": "OPENING_INVENTORY_BBL",
-    "Production": "PRODUCTION_BBL",
-    "Pipeline In": "PIPELINE_IN_BBL",
-    "Pipeline Out": "PIPELINE_OUT_BBL",
-    "Adjustments": "ADJUSTMENTS_BBL",
-    "Gain/Loss": "GAIN_LOSS_BBL",
-    "Transfers": "TRANSFERS_BBL",
-    "Tank Capacity": "TANK_CAPACITY_BBL",
-    "Safe Fill Limit": "SAFE_FILL_LIMIT_BBL",
-    "Available Space": "AVAILABLE_SPACE_BBL",
+    COL_BATCH_IN_RAW: "RECEIPTS_BBL",
+    COL_BATCH_OUT_RAW: "DELIVERIES_BBL",
+    COL_RACK_LIFTINGS_RAW: "RACK_LIFTINGS_BBL",
+    COL_CLOSE_INV_RAW: "CLOSING_INVENTORY_BBL",
+    COL_OPEN_INV_RAW: "OPENING_INVENTORY_BBL",
+    COL_PRODUCTION: "PRODUCTION_BBL",
+    COL_PIPELINE_IN: "PIPELINE_IN_BBL",
+    COL_PIPELINE_OUT: "PIPELINE_OUT_BBL",
+    COL_ADJUSTMENTS: "ADJUSTMENTS_BBL",
+    COL_GAIN_LOSS: "GAIN_LOSS_BBL",
+    COL_TRANSFERS: "TRANSFERS_BBL",
+    COL_TANK_CAPACITY: "TANK_CAPACITY_BBL",
+    COL_SAFE_FILL_LIMIT: "SAFE_FILL_LIMIT_BBL",
+    COL_AVAILABLE_SPACE: "AVAILABLE_SPACE_BBL",
 }
 
 
@@ -236,29 +262,147 @@ def load_source_status() -> pd.DataFrame:
 
 
 def initialize_data():
+    """Initialize lightweight session state.
+
+    We intentionally avoid loading the full inventory table up-front. Instead, we:
+    - load available regions (small distinct query)
+    - load source-status table (already small)
+
+    Actual inventory data is loaded only when the user submits filters.
+    """
+
     if "data_loaded" not in st.session_state:
-        label = "Snowflake" if DATA_SOURCE == "snowflake" else "SQLite"
+        # Load and cache source freshness/status
+        try:
+            st.session_state.source_status = load_source_status()
+        except Exception:
+            # Don't block the app if status table isn't available
+            st.session_state.source_status = pd.DataFrame()
 
-        with st.spinner(f"Loading inventory data from {label}..."):
-            all_data = load_inventory_data()
-            regions = sorted(all_data["Region"].dropna().unique().tolist())
-
-            # Load and cache source freshness/status
-            try:
-                st.session_state.source_status = load_source_status()
-            except Exception:
-                # Don't block the app if status table isn't available
-                st.session_state.source_status = pd.DataFrame()
-
-            st.session_state.regions = regions
-            st.session_state.data = {}
-            for region in regions:
-                st.session_state.data[region] = all_data[all_data["Region"] == region].copy()
-
-            st.session_state.data_loaded = True
-            st.session_state.all_data = all_data
+        st.session_state.regions = load_regions()
+        st.session_state.data_loaded = True
 
     return st.session_state.get("regions", [])
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_regions() -> list[str]:
+    """Return all regions available in the source (distinct list)."""
+
+    if DATA_SOURCE == "sqlite":
+        import sqlite3
+
+        conn = sqlite3.connect(SQLITE_DB_PATH)
+        try:
+            df = pd.read_sql_query(
+                f"SELECT DISTINCT REGION_CODE AS Region FROM {SQLITE_TABLE} WHERE REGION_CODE IS NOT NULL ORDER BY REGION_CODE",
+                conn,
+            )
+        finally:
+            conn.close()
+        return sorted(df["Region"].dropna().astype(str).unique().tolist())
+
+    # Snowflake
+    session = get_snowflake_session()
+    session.sql(f"USE WAREHOUSE {SNOWFLAKE_WAREHOUSE}").collect()
+    df = session.sql(
+        f"SELECT DISTINCT REGION_CODE AS Region FROM {RAW_INVENTORY_TABLE} WHERE REGION_CODE IS NOT NULL ORDER BY REGION_CODE"
+    ).to_pandas()
+    return sorted(df["Region"].dropna().astype(str).unique().tolist())
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_region_filter_metadata(*, region: str | None, loc_col: str) -> dict:
+    """Return lightweight metadata for sidebar filters: locations/systems + date bounds."""
+
+    region_norm = _normalize_region_label(region) if region else None
+
+    if DATA_SOURCE == "sqlite":
+        import sqlite3
+
+        conn = sqlite3.connect(SQLITE_DB_PATH)
+        try:
+            if loc_col == "System":
+                sys_sql = f"""
+                    SELECT DISTINCT
+                        CASE
+                            WHEN SOURCE_OPERATOR IS NOT NULL AND TRIM(SOURCE_OPERATOR) != '' THEN SOURCE_OPERATOR
+                            WHEN SOURCE_SYSTEM IS NOT NULL AND TRIM(SOURCE_SYSTEM) != '' THEN SOURCE_SYSTEM
+                            ELSE LOCATION_CODE
+                        END AS System
+                    FROM {SQLITE_TABLE}
+                    WHERE DATA_DATE IS NOT NULL
+                      AND (? IS NULL OR REGION_CODE = ?)
+                    ORDER BY System
+                """
+                df_locs = pd.read_sql_query(sys_sql, conn, params=[region_norm, region_norm])
+                locations = sorted(df_locs["System"].dropna().astype(str).unique().tolist())
+            else:
+                loc_sql = f"""
+                    SELECT DISTINCT LOCATION_CODE AS Location
+                    FROM {SQLITE_TABLE}
+                    WHERE DATA_DATE IS NOT NULL
+                      AND (? IS NULL OR REGION_CODE = ?)
+                      AND LOCATION_CODE IS NOT NULL
+                    ORDER BY Location
+                """
+                df_locs = pd.read_sql_query(loc_sql, conn, params=[region_norm, region_norm])
+                locations = sorted(df_locs["Location"].dropna().astype(str).unique().tolist())
+
+            dates_sql = f"""
+                SELECT MIN(DATA_DATE) AS min_date, MAX(DATA_DATE) AS max_date
+                FROM {SQLITE_TABLE}
+                WHERE DATA_DATE IS NOT NULL
+                  AND (? IS NULL OR REGION_CODE = ?)
+            """
+            df_dates = pd.read_sql_query(dates_sql, conn, params=[region_norm, region_norm])
+        finally:
+            conn.close()
+
+        min_date = pd.to_datetime(df_dates.iloc[0]["min_date"], errors="coerce") if not df_dates.empty else pd.NaT
+        max_date = pd.to_datetime(df_dates.iloc[0]["max_date"], errors="coerce") if not df_dates.empty else pd.NaT
+        return {
+            "locations": locations,
+            "min_date": min_date,
+            "max_date": max_date,
+        }
+
+    # Snowflake
+    session = get_snowflake_session()
+    session.sql(f"USE WAREHOUSE {SNOWFLAKE_WAREHOUSE}").collect()
+    region_escaped = str(region_norm).replace("'", "''") if region_norm else ""
+    region_filter = "" if not region_norm else f" AND REGION_CODE = '{region_escaped}'"
+
+    if loc_col == "System":
+        loc_query = f"""
+            SELECT DISTINCT
+                COALESCE(NULLIF(SOURCE_OPERATOR, ''), NULLIF(SOURCE_SYSTEM, ''), LOCATION_CODE) AS System
+            FROM {RAW_INVENTORY_TABLE}
+            WHERE DATA_DATE IS NOT NULL {region_filter}
+            ORDER BY System
+        """
+        df_locs = session.sql(loc_query).to_pandas()
+        locations = sorted(df_locs["SYSTEM"].dropna().astype(str).unique().tolist()) if "SYSTEM" in df_locs.columns else []
+    else:
+        loc_query = f"""
+            SELECT DISTINCT LOCATION_CODE AS Location
+            FROM {RAW_INVENTORY_TABLE}
+            WHERE DATA_DATE IS NOT NULL {region_filter}
+              AND LOCATION_CODE IS NOT NULL
+            ORDER BY Location
+        """
+        df_locs = session.sql(loc_query).to_pandas()
+        locations = sorted(df_locs["LOCATION"].dropna().astype(str).unique().tolist()) if "LOCATION" in df_locs.columns else []
+
+    date_query = f"""
+        SELECT MIN(DATA_DATE) AS min_date, MAX(DATA_DATE) AS max_date
+        FROM {RAW_INVENTORY_TABLE}
+        WHERE DATA_DATE IS NOT NULL {region_filter}
+    """
+    df_dates = session.sql(date_query).to_pandas()
+    min_date = pd.to_datetime(df_dates.iloc[0]["MIN_DATE"], errors="coerce") if not df_dates.empty else pd.NaT
+    max_date = pd.to_datetime(df_dates.iloc[0]["MAX_DATE"], errors="coerce") if not df_dates.empty else pd.NaT
+    return {"locations": locations, "min_date": min_date, "max_date": max_date}
 
 
 def ensure_numeric_columns(df_filtered: pd.DataFrame) -> pd.DataFrame:
@@ -266,3 +410,301 @@ def ensure_numeric_columns(df_filtered: pd.DataFrame) -> pd.DataFrame:
         if col in df_filtered.columns:
             df_filtered[col] = pd.to_numeric(df_filtered[col], errors="coerce").fillna(0)
     return df_filtered
+
+
+def _normalize_region_label(active_region: str | None) -> str | None:
+    """Normalize UI region labels to match data Region values."""
+    if active_region is None:
+        return None
+    return "Midcon" if active_region == "Group Supply Report (Midcon)" else active_region
+
+
+def create_sidebar_filters(regions: list[str], df_region: pd.DataFrame) -> dict:
+    """Create sidebar filters UI.
+
+    This replaces sidebar_filters.py.
+    Key differences vs old behavior:
+    - Location/System is **single-select**
+    - Product filter removed
+    - Designed to be used inside a Streamlit form with a submit button
+    """
+
+    st.header("🔍 Filters")
+
+    # Region selector
+    if regions:
+        active_region = st.selectbox("Select Region", regions, key="active_region")
+    else:
+        active_region = None
+        st.warning("No regions available")
+
+    # Location/System selector
+    loc_col = "System" if _normalize_region_label(active_region) == "Midcon" else "Location"
+    filter_label = "🏭 System" if loc_col == "System" else "📍 Location"
+    if df_region is not None and not df_region.empty and loc_col in df_region.columns:
+        locations = sorted(df_region[loc_col].dropna().unique().tolist())
+        df_min = df_region["Date"].min() if "Date" in df_region.columns else pd.NaT
+        df_max = df_region["Date"].max() if "Date" in df_region.columns else pd.NaT
+    else:
+        meta = load_region_filter_metadata(region=active_region, loc_col=loc_col)
+        locations = meta.get("locations", [])
+        df_min = meta.get("min_date", pd.NaT)
+        df_max = meta.get("max_date", pd.NaT)
+
+    if not locations:
+        st.warning("No locations available")
+        selected_loc = None
+    else:
+        selected_loc = st.selectbox(filter_label, options=locations, index=0, key="selected_loc")
+
+    # Date range selector
+    today = date.today()
+    scope_location = None if selected_loc is None else str(selected_loc)
+    from admin_config import get_default_date_window
+
+    start_off, end_off = get_default_date_window(
+        region=_normalize_region_label(active_region or "Unknown") or "Unknown",
+        location=scope_location,
+    )
+    default_start = today + timedelta(days=int(start_off))
+    default_end = today + timedelta(days=int(end_off))
+
+    df_min_d = pd.to_datetime(df_min, errors="coerce").date() if pd.notna(df_min) else default_start
+    df_max_d = pd.to_datetime(df_max, errors="coerce").date() if pd.notna(df_max) else default_end
+
+    min_value = min(df_min_d, default_start)
+    max_value = max(df_max_d, default_end)
+
+    # Default: show DB min if older than configured start; always extend to max available.
+    actual_start = df_min_d if df_min_d < default_start else default_start
+    actual_end = max_value
+
+    date_range = st.date_input(
+        "Date Range",
+        value=(actual_start, actual_end),
+        min_value=min_value,
+        max_value=max_value,
+        key=f"date_{active_region}_{scope_location or 'all'}",
+    )
+
+    if isinstance(date_range, (list, tuple)):
+        if len(date_range) == 2:
+            start_date, end_date = date_range
+        else:
+            start_date = end_date = date_range[0] if date_range else date.today()
+    else:
+        start_date = end_date = date_range
+
+    start_ts, end_ts = pd.to_datetime(start_date), pd.to_datetime(end_date)
+
+    return {
+        "active_region": active_region,
+        "start_ts": start_ts,
+        "end_ts": end_ts,
+        "selected_loc": selected_loc,
+        "loc_col": loc_col,
+        "locations": locations,
+    }
+
+
+def apply_filters(df_region: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    """Apply the selected filters to the dataframe (in-memory).
+
+    Note: with the new submit-driven querying, this will often be applied to
+    already-filtered DB results. It's still useful as a safety net.
+    """
+
+    df_filtered = df_region.copy()
+
+    if df_filtered.empty:
+        return df_filtered
+
+    # Apply date filter
+    if "Date" in df_filtered.columns:
+        df_filtered = df_filtered[
+            (df_filtered["Date"] >= filters["start_ts"]) &
+            (df_filtered["Date"] <= filters["end_ts"])
+        ]
+
+    # Apply location/system filter
+    loc_col = filters.get("loc_col", "Location")
+    selected_loc = filters.get("selected_loc")
+    if selected_loc and loc_col in df_filtered.columns:
+        df_filtered = df_filtered[df_filtered[loc_col].isin([selected_loc])]
+
+    return df_filtered
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def _load_inventory_data_filtered_cached(
+    source: str,
+    sqlite_db_path: str,
+    sqlite_table: str,
+    *,
+    region: str | None,
+    loc_col: str,
+    selected_loc: str | None,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+) -> pd.DataFrame:
+    """Load inventory data filtered at the source (SQLite/Snowflake).
+
+    This is the performance-critical path: we avoid loading the entire dataset
+    when users only need a small slice.
+    """
+
+    region_norm = _normalize_region_label(region) if region else None
+
+    if source == "sqlite":
+        import sqlite3
+
+        start_s = pd.Timestamp(start_ts).strftime("%Y-%m-%d")
+        end_s = pd.Timestamp(end_ts).strftime("%Y-%m-%d")
+
+        where = ["DATA_DATE IS NOT NULL", "DATA_DATE >= ?", "DATA_DATE <= ?"]
+        params: list[object] = [start_s, end_s]
+
+        if region_norm:
+            where.append("REGION_CODE = ?")
+            params.append(region_norm)
+
+        # We filter by LOCATION_CODE in SQL for both Location and System.
+        # For Midcon/System, System is normalized from SOURCE_OPERATOR/SOURCE_SYSTEM,
+        # which isn't reliably filterable in SQLite without complex logic.
+        # If the user selects a System, we apply it after normalization.
+        if selected_loc and loc_col == "Location":
+            where.append("LOCATION_CODE = ?")
+            params.append(str(selected_loc))
+
+        sql = f"""
+            SELECT *
+            FROM {sqlite_table}
+            WHERE {' AND '.join(where)}
+            ORDER BY DATA_DATE DESC, LOCATION_CODE
+        """
+
+        conn = sqlite3.connect(sqlite_db_path)
+        raw_df = pd.read_sql_query(sql, conn, params=params)
+        conn.close()
+
+        df = _normalize_inventory_df(raw_df)
+        if selected_loc and loc_col == "System":
+            df = df[df["System"].astype(str) == str(selected_loc)]
+        return df
+
+    if source != "snowflake":
+        raise ValueError("DATA_SOURCE must be 'snowflake' or 'sqlite'")
+
+    session = get_snowflake_session()
+    session.sql(f"USE WAREHOUSE {SNOWFLAKE_WAREHOUSE}").collect()
+
+    # Snowflake filter pushdown
+    conditions = ["DATA_DATE IS NOT NULL", "DATA_DATE >= %(start)s", "DATA_DATE <= %(end)s"]
+    binds: dict[str, object] = {
+        "start": pd.Timestamp(start_ts).strftime("%Y-%m-%d"),
+        "end": pd.Timestamp(end_ts).strftime("%Y-%m-%d"),
+    }
+    if region_norm:
+        conditions.append("REGION_CODE = %(region)s")
+        binds["region"] = region_norm
+    if selected_loc and loc_col == "Location":
+        conditions.append("LOCATION_CODE = %(loc)s")
+        binds["loc"] = str(selected_loc)
+
+    where_sql = " AND ".join(conditions)
+    query = f"""
+    SELECT
+        DATA_DATE,
+        REGION_CODE,
+        LOCATION_CODE,
+        PRODUCT_DESCRIPTION,
+        SOURCE_OPERATOR,
+        CAST(COALESCE(RECEIPTS_BBL, 0) AS FLOAT) as RECEIPTS_BBL,
+        CAST(COALESCE(DELIVERIES_BBL, 0) AS FLOAT) as DELIVERIES_BBL,
+        CAST(COALESCE(RACK_LIFTINGS_BBL, 0) AS FLOAT) as RACK_LIFTINGS_BBL,
+        CAST(COALESCE(CLOSING_INVENTORY_BBL, 0) AS FLOAT) as CLOSING_INVENTORY_BBL,
+        CAST(COALESCE(OPENING_INVENTORY_BBL, 0) AS FLOAT) as OPENING_INVENTORY_BBL,
+        CAST(COALESCE(PRODUCTION_BBL, 0) AS FLOAT) as PRODUCTION_BBL,
+        CAST(COALESCE(PIPELINE_IN_BBL, 0) AS FLOAT) as PIPELINE_IN_BBL,
+        CAST(COALESCE(PIPELINE_OUT_BBL, 0) AS FLOAT) as PIPELINE_OUT_BBL,
+        CAST(COALESCE(TRY_TO_DOUBLE(ADJUSTMENTS_BBL), 0) AS FLOAT) as ADJUSTMENTS_BBL,
+        CAST(COALESCE(TRY_TO_DOUBLE(GAIN_LOSS_BBL), 0) AS FLOAT) as GAIN_LOSS_BBL,
+        CAST(COALESCE(TRY_TO_DOUBLE(TRANSFERS_BBL), 0) AS FLOAT) as TRANSFERS_BBL,
+        CAST(COALESCE(TANK_CAPACITY_BBL, 0) AS FLOAT) as TANK_CAPACITY_BBL,
+        CAST(COALESCE(SAFE_FILL_LIMIT_BBL, 0) AS FLOAT) as SAFE_FILL_LIMIT_BBL,
+        CAST(COALESCE(AVAILABLE_SPACE_BBL, 0) AS FLOAT) as AVAILABLE_SPACE_BBL,
+        INVENTORY_KEY,
+        SOURCE_FILE_ID,
+        CREATED_AT
+    FROM {RAW_INVENTORY_TABLE}
+    WHERE {where_sql}
+    ORDER BY DATA_DATE DESC, LOCATION_CODE, PRODUCT_CODE
+    """
+
+    # Bind substitution (safe basic string quoting)
+    for k, v in binds.items():
+        query = query.replace(f"%({k})s", "'" + str(v).replace("'", "''") + "'")
+
+    raw_df = session.sql(query).to_pandas()
+    df = _normalize_inventory_df(raw_df)
+    if selected_loc and loc_col == "System":
+        df = df[df["System"].astype(str) == str(selected_loc)]
+    return df
+
+
+def load_filtered_inventory_data(filters: dict) -> pd.DataFrame:
+    """Load inventory data using filter pushdown."""
+    return _load_inventory_data_filtered_cached(
+        DATA_SOURCE,
+        SQLITE_DB_PATH,
+        SQLITE_TABLE,
+        region=filters.get("active_region"),
+        loc_col=str(filters.get("loc_col") or "Location"),
+        selected_loc=(None if filters.get("selected_loc") in (None, "") else str(filters.get("selected_loc"))),
+        start_ts=pd.Timestamp(filters.get("start_ts")),
+        end_ts=pd.Timestamp(filters.get("end_ts")),
+    )
+
+
+def require_selected_location(filters: dict) -> None:
+    """Enforce that a location/system must be selected before loading data."""
+    if filters.get("selected_loc") in (None, ""):
+        st.warning("Please select a Location/System before submitting filters.")
+        st.stop()
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_region_location_pairs() -> pd.DataFrame:
+    """Small helper for admin UI: distinct Region/Location pairs."""
+
+    if DATA_SOURCE == "sqlite":
+        import sqlite3
+
+        conn = sqlite3.connect(SQLITE_DB_PATH)
+        try:
+            df = pd.read_sql_query(
+                f"""
+                SELECT DISTINCT
+                    REGION_CODE AS Region,
+                    LOCATION_CODE AS Location
+                FROM {SQLITE_TABLE}
+                WHERE REGION_CODE IS NOT NULL
+                  AND LOCATION_CODE IS NOT NULL
+                """,
+                conn,
+            )
+        finally:
+            conn.close()
+        return df
+
+    session = get_snowflake_session()
+    session.sql(f"USE WAREHOUSE {SNOWFLAKE_WAREHOUSE}").collect()
+    query = f"""
+        SELECT DISTINCT
+            REGION_CODE AS Region,
+            LOCATION_CODE AS Location
+        FROM {RAW_INVENTORY_TABLE}
+        WHERE REGION_CODE IS NOT NULL
+          AND LOCATION_CODE IS NOT NULL
+    """
+    return session.sql(query).to_pandas()

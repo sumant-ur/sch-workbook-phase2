@@ -8,8 +8,14 @@ import pandas as pd
 
 # Import modules
 from ui_components import setup_page, apply_custom_css, display_header, display_data_freshness_cards
-from data_loader import initialize_data, ensure_numeric_columns
-from sidebar_filters import create_sidebar_filters, apply_filters
+from data_loader import (
+    initialize_data,
+    ensure_numeric_columns,
+    create_sidebar_filters,
+    load_filtered_inventory_data,
+    require_selected_location,
+    apply_filters,
+)
 from summary_tab import display_regional_summary, display_forecast_table
 from details_tab import display_details_tab
 from admin_config import display_super_admin_panel
@@ -23,7 +29,7 @@ def main():
     apply_custom_css()
     display_header()
 
-    # Initialize data
+    # Initialize lightweight metadata (regions + source status)
     regions = initialize_data()
 
     if "admin_view" not in st.session_state:
@@ -36,42 +42,46 @@ def main():
 
     regions = st.session_state.regions
 
-    # Get active region from sidebar (or first region if none selected)
-    if regions:
-        # Get region data
-        active_region = st.session_state.get("active_region", regions[0])
-        df_region = st.session_state.data.get(active_region, pd.DataFrame())
-    else:
-        active_region = None
-        df_region = pd.DataFrame()
+    # We no longer preload per-region dataframes. We only keep a filtered
+    # dataframe after the user hits Submit.
+    active_region = st.session_state.get("active_region", regions[0] if regions else None)
+    df_region = pd.DataFrame()
 
     if st.session_state.admin_view:
         st.sidebar.button("⬅️ Back", key="admin_back", on_click=lambda: st.session_state.update({"admin_view": False}))
         display_super_admin_panel(
             regions=regions,
             active_region=active_region,
-            all_data=st.session_state.get("all_data", pd.DataFrame()),
+            all_data=None,
         )
         return
 
-    # Create sidebar filters
-    filters = create_sidebar_filters(regions, df_region)
-    active_region = filters["active_region"]
+    # Sidebar filters with explicit Submit
+    with st.sidebar.form("filters_form", clear_on_submit=False):
+        filters = create_sidebar_filters(regions, df_region)
+        submitted = st.form_submit_button("✅ Submit Filters")
+
+    active_region = filters.get("active_region")
+
+    # Load data ONLY when submitted, or on first load if we don't have data yet.
+    if submitted or ("df_filtered" not in st.session_state and active_region is not None):
+        with st.spinner("Fetching filtered inventory data..."):
+            require_selected_location(filters)
+            df_loaded = load_filtered_inventory_data(filters)
+            # Safety-net in-memory filtering (should typically be no-op)
+            df_loaded = apply_filters(df_loaded, filters)
+            df_loaded = ensure_numeric_columns(df_loaded)
+
+        st.session_state.df_filtered = df_loaded
+        st.session_state.active_filters = filters
 
     st.sidebar.markdown("---")
     if st.sidebar.button("🛠️ Super Admin Config", key="admin_open"):
         st.session_state.admin_view = True
         st.rerun()
 
-    # Update region data based on selected region
-    if active_region:
-        df_region = st.session_state.data.get(active_region, pd.DataFrame())
-
-    # Apply filters
-    df_filtered = apply_filters(df_region, filters)
-
-    # Ensure numeric columns
-    df_filtered = ensure_numeric_columns(df_filtered)
+    df_filtered = st.session_state.get("df_filtered", pd.DataFrame())
+    active_filters = st.session_state.get("active_filters", filters)
 
     # Display data freshness cards
     if active_region:
@@ -88,7 +98,7 @@ def main():
 
     # Details Tab
     with details_tab:
-        display_details_tab(df_filtered, active_region, filters["end_ts"])
+        display_details_tab(df_filtered, active_region, active_filters["end_ts"])
 
 
 if __name__ == "__main__":

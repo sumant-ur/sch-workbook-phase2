@@ -15,3 +15,84 @@ GLOBAL_INTRANSIT_FALLBACK = 0
 RAW_INVENTORY_TABLE = "CONSUMPTION.HFS_COMMERCIAL_INVENTORY.APP_INVENTORY"
 SNOWFLAKE_ADMIN_CONFIG_TABLE = "CONSUMPTION.HFS_COMMERCIAL_INVENTORY.APP_SUPERADMIN_CONFIG"
 SQLITE_ADMIN_CONFIG_TABLE = "APP_SUPERADMIN_CONFIG"
+
+
+# -----------------------------------------------------------------------------
+# Data source / storage configuration
+# -----------------------------------------------------------------------------
+
+# Choose data source: "sqlite" for local/dev or "snowflake" for prod
+DATA_SOURCE = "sqlite"  # "snowflake"
+
+# SQLite configuration
+SQLITE_DB_PATH = "inventory.db"
+SQLITE_TABLE = "APP_INVENTORY"
+SQLITE_SOURCE_STATUS_TABLE = "APP_SOURCE_STATUS"
+
+# Snowflake configuration
+SNOWFLAKE_WAREHOUSE = "HFS_ADHOC_WH"
+SNOWFLAKE_SOURCE_STATUS_TABLE = "CONSUMPTION.HFS_COMMERCIAL_INVENTORY.APP_SOURCE_STATUS"
+
+
+# -----------------------------------------------------------------------------
+# Canonical column names used across the dashboard
+# -----------------------------------------------------------------------------
+
+# Base columns
+COL_DATE = "Date"
+COL_REGION = "Region"
+COL_LOCATION = "Location"
+COL_SYSTEM = "System"
+COL_PRODUCT = "Product"
+COL_SOURCE = "source"
+COL_UPDATED = "updated"
+COL_NOTES = "Notes"
+
+# Inventory columns
+COL_OPEN_INV_RAW = "Open Inv"
+COL_CLOSE_INV_RAW = "Close Inv"
+COL_OPENING_INV = "Opening Inv"  # renamed for UI/editor
+
+# Flows
+COL_BATCH_IN_RAW = "Batch In (RECEIPTS_BBL)"
+COL_BATCH_OUT_RAW = "Batch Out (DELIVERIES_BBL)"
+COL_BATCH_IN = "Batch In"  # renamed for UI/editor
+COL_BATCH_OUT = "Batch Out"  # renamed for UI/editor
+
+COL_RACK_LIFTINGS_RAW = "Rack/Liftings"
+COL_RACK_LIFTING = "Rack/Lifting"  # renamed for UI/editor
+
+COL_PIPELINE_IN = "Pipeline In"
+COL_PIPELINE_OUT = "Pipeline Out"
+COL_PRODUCTION = "Production"
+COL_ADJUSTMENTS = "Adjustments"
+COL_GAIN_LOSS = "Gain/Loss"
+COL_TRANSFERS = "Transfers"
+
+# Capacities/thresholds
+COL_TANK_CAPACITY = "Tank Capacity"
+COL_SAFE_FILL_LIMIT = "Safe Fill Limit"
+COL_AVAILABLE_SPACE = "Available Space"
+
+
+# Convenience groups
+SUMMARY_AGG_COLS = (
+    COL_CLOSE_INV_RAW,
+    COL_OPEN_INV_RAW,
+    COL_BATCH_IN_RAW,
+    COL_BATCH_OUT_RAW,
+    COL_RACK_LIFTINGS_RAW,
+    COL_PRODUCTION,
+    COL_PIPELINE_IN,
+    COL_PIPELINE_OUT,
+    COL_TANK_CAPACITY,
+    COL_SAFE_FILL_LIMIT,
+    COL_AVAILABLE_SPACE,
+)
+
+DETAILS_RENAME_MAP = {
+    COL_OPEN_INV_RAW: COL_OPENING_INV,
+    COL_BATCH_IN_RAW: COL_BATCH_IN,
+    COL_BATCH_OUT_RAW: COL_BATCH_OUT,
+    COL_RACK_LIFTINGS_RAW: COL_RACK_LIFTING,
+}

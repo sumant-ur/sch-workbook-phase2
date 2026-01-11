@@ -18,6 +18,25 @@ from config import (
     GLOBAL_INTRANSIT_FALLBACK,
 )
 
+from config import (
+    COL_AVAILABLE_SPACE,
+    COL_BATCH_IN_RAW,
+    COL_BATCH_OUT_RAW,
+    COL_CLOSE_INV_RAW,
+    COL_DATE,
+    COL_OPEN_INV_RAW,
+    COL_PIPELINE_IN,
+    COL_PIPELINE_OUT,
+    COL_PRODUCT,
+    COL_PRODUCTION,
+    COL_RACK_LIFTINGS_RAW,
+    COL_SAFE_FILL_LIMIT,
+    COL_SYSTEM,
+    COL_LOCATION,
+    COL_TANK_CAPACITY,
+    COL_REGION,
+)
+
 
 def _normalize_region(active_region: str) -> str:
     return "Midcon" if active_region == "Group Supply Report (Midcon)" else active_region
@@ -28,7 +47,7 @@ def _is_midcon(active_region: str) -> bool:
 
 
 def calculate_required_max(row, group_cols, df_filtered):
-    region = str(row.get("Region") or "Unknown")
+    region = str(row.get(COL_REGION) or "Unknown")
     loc_or_sys = row.get(group_cols[0])
     overrides = get_threshold_overrides(region=_normalize_region(region), location=str(loc_or_sys) if pd.notna(loc_or_sys) else None)
 
@@ -36,18 +55,18 @@ def calculate_required_max(row, group_cols, df_filtered):
     if safefill is not None and not pd.isna(safefill):
         return float(safefill)
 
-    prod = str(row.get("Product") or "")
+    prod = str(row.get(COL_PRODUCT) or "")
     key = f"{loc_or_sys}|{prod}"
     if key in REQUIRED_MAX_DEFAULTS:
         return float(REQUIRED_MAX_DEFAULTS[key])
     if prod in REQUIRED_MAX_DEFAULTS:
         return float(REQUIRED_MAX_DEFAULTS[prod])
 
-    if "Safe Fill Limit" in df_filtered.columns and group_cols[0] in df_filtered.columns:
+    if COL_SAFE_FILL_LIMIT in df_filtered.columns and group_cols[0] in df_filtered.columns:
         safe_fill = df_filtered[
             (df_filtered[group_cols[0]] == row[group_cols[0]]) &
-            (df_filtered["Product"] == row["Product"])
-        ]["Safe Fill Limit"].max()
+            (df_filtered[COL_PRODUCT] == row[COL_PRODUCT])
+        ][COL_SAFE_FILL_LIMIT].max()
         if pd.notna(safe_fill) and safe_fill > 0:
             return float(safe_fill)
 
@@ -56,14 +75,14 @@ def calculate_required_max(row, group_cols, df_filtered):
 
 def calculate_intransit(row, group_cols, df_filtered):
     """Calculate intransit based on pipeline data or defaults."""
-    if group_cols[0] == "System":
-        key = f"{row['System']}|{row['Product']}"
-        prod_key = row["Product"]
+    if group_cols[0] == COL_SYSTEM:
+        key = f"{row[COL_SYSTEM]}|{row[COL_PRODUCT]}"
+        prod_key = row[COL_PRODUCT]
     else:
-        key = f"{row['Location']}|{row['Product']}"
-        prod_key = row["Product"]
+        key = f"{row[COL_LOCATION]}|{row[COL_PRODUCT]}"
+        prod_key = row[COL_PRODUCT]
 
-    pipeline_val = row.get("Pipeline In", 0)
+    pipeline_val = row.get(COL_PIPELINE_IN, 0)
     if pd.notna(pipeline_val) and pipeline_val > 0:
         return float(pipeline_val)
 
@@ -76,7 +95,7 @@ def calculate_intransit(row, group_cols, df_filtered):
 
 
 def calculate_required_min(row, group_cols, df_filtered):
-    region = str(row.get("Region") or "Unknown")
+    region = str(row.get(COL_REGION) or "Unknown")
     loc_or_sys = row.get(group_cols[0])
     overrides = get_threshold_overrides(region=_normalize_region(region), location=str(loc_or_sys) if pd.notna(loc_or_sys) else None)
 
@@ -84,7 +103,7 @@ def calculate_required_min(row, group_cols, df_filtered):
     if bottom is not None and not pd.isna(bottom):
         return float(bottom)
 
-    prod = str(row.get("Product") or "")
+    prod = str(row.get(COL_PRODUCT) or "")
     key = f"{loc_or_sys}|{prod}"
     if key in REQUIRED_MIN_DEFAULTS:
         return float(REQUIRED_MIN_DEFAULTS[key])
@@ -103,14 +122,14 @@ def display_regional_summary(df_filtered, active_region):
         return
 
     # Determine sales column
-    sales_cols = [c for c in ["Rack/Liftings", "Batch Out (DELIVERIES_BBL)"] if c in df_filtered.columns]
+    sales_cols = [c for c in [COL_RACK_LIFTINGS_RAW, COL_BATCH_OUT_RAW] if c in df_filtered.columns]
     region_name = _normalize_region(active_region)
 
     # Group by Location/System and Product
     if _is_midcon(active_region):
-        group_cols = ["System", "Product"]
+        group_cols = [COL_SYSTEM, COL_PRODUCT]
     else:
-        group_cols = ["Location", "Product"]
+        group_cols = [COL_LOCATION, COL_PRODUCT]
 
     if not all(col in df_filtered.columns for col in group_cols):
         st.warning("Required columns not found in the data.")
@@ -119,19 +138,19 @@ def display_regional_summary(df_filtered, active_region):
     # Daily aggregation
     daily = (
         df_filtered
-        .groupby(group_cols + ["Date"], as_index=False)
+        .groupby(group_cols + [COL_DATE], as_index=False)
         .agg({
-            "Close Inv": "last",
-            "Open Inv": "first",
-            "Batch In (RECEIPTS_BBL)": "sum",
-            "Batch Out (DELIVERIES_BBL)": "sum",
-            "Rack/Liftings": "sum",
-            "Production": "sum",
-            "Pipeline In": "sum",
-            "Pipeline Out": "sum",
-            "Tank Capacity": "max",
-            "Safe Fill Limit": "max",
-            "Available Space": "mean"
+            COL_CLOSE_INV_RAW: "last",
+            COL_OPEN_INV_RAW: "first",
+            COL_BATCH_IN_RAW: "sum",
+            COL_BATCH_OUT_RAW: "sum",
+            COL_RACK_LIFTINGS_RAW: "sum",
+            COL_PRODUCTION: "sum",
+            COL_PIPELINE_IN: "sum",
+            COL_PIPELINE_OUT: "sum",
+            COL_TANK_CAPACITY: "max",
+            COL_SAFE_FILL_LIMIT: "max",
+            COL_AVAILABLE_SPACE: "mean",
         })
     )
 
@@ -142,14 +161,14 @@ def display_regional_summary(df_filtered, active_region):
         st.info("No data available for the selected filters.")
         return
 
-    latest_date = daily["Date"].max()
-    prior_mask = daily["Date"] < latest_date
-    prior_day = daily.loc[prior_mask, "Date"].max() if prior_mask.any() else pd.NaT
+    latest_date = daily[COL_DATE].max()
+    prior_mask = daily[COL_DATE] < latest_date
+    prior_day = daily.loc[prior_mask, COL_DATE].max() if prior_mask.any() else pd.NaT
 
     # Calculate 7-day average
     def compute_7day_avg(g):
-        g = g.sort_values("Date")
-        window = g[g["Date"] <= latest_date].tail(7)
+        g = g.sort_values(COL_DATE)
+        window = g[g[COL_DATE] <= latest_date].tail(7)
         return pd.Series({"Seven_Day_Avg_Sales": window["Sales"].mean() if not window.empty else 0})
 
     seven_day = daily.groupby(group_cols).apply(compute_7day_avg).reset_index()
@@ -157,7 +176,7 @@ def display_regional_summary(df_filtered, active_region):
     # Latest inventory
     latest = (
         daily
-        .sort_values(["Date"])
+        .sort_values([COL_DATE])
         .groupby(group_cols, as_index=False)
         .last()
     )
@@ -165,7 +184,7 @@ def display_regional_summary(df_filtered, active_region):
     # Prior day sales
     if pd.notna(prior_day):
         pds = (
-            daily[daily["Date"] == prior_day]
+            daily[daily[COL_DATE] == prior_day]
             .groupby(group_cols, as_index=False)["Sales"].sum()
             .rename(columns={"Sales": "Prior_Day_Sales"})
         )
@@ -175,7 +194,7 @@ def display_regional_summary(df_filtered, active_region):
 
     # Build summary DataFrame
     summary_df = (
-        latest[group_cols + ["Close Inv", "Pipeline In"]]
+        latest[group_cols + [COL_CLOSE_INV_RAW, COL_PIPELINE_IN]]
         .merge(pds, on=group_cols, how="left")
         .merge(seven_day, on=group_cols, how="left")
     )
@@ -199,7 +218,7 @@ def display_regional_summary(df_filtered, active_region):
     ).astype(float)
 
     # Inventory metrics
-    summary_df["Gross Inventory"] = summary_df["Close Inv"].fillna(0).astype(float)
+    summary_df["Gross Inventory"] = summary_df[COL_CLOSE_INV_RAW].fillna(0).astype(float)
     summary_df["Total Inventory"] = (
         summary_df["Gross Inventory"] + summary_df["In-Transit"].fillna(0)
     ).astype(float)
@@ -242,18 +261,17 @@ def display_regional_summary(df_filtered, active_region):
     ]
 
     final_cols = [c for c in desired_order if c in display_df.columns]
-        # st.dataframe(
-        #     display_df[final_cols],
-        #     width="stretch",
-        #     height=320
-        # )
+    # st.dataframe(
+    #     display_df[final_cols],
+    #     width="stretch",
+    #     height=320
+    # )
 
     st.dataframe(
-    display_df[final_cols],
-    use_container_width=True,
-    height=320
+        display_df[final_cols],
+        use_container_width=True,
+        height=320
     )
-
 
 
 def display_forecast_table(df_filtered, active_region):
@@ -266,9 +284,9 @@ def display_forecast_table(df_filtered, active_region):
 
     # Determine group columns based on region
     if _is_midcon(active_region):
-        group_cols = ["System", "Product"]
+        group_cols = [COL_SYSTEM, COL_PRODUCT]
     else:
-        group_cols = ["Location", "Product"]
+        group_cols = [COL_LOCATION, COL_PRODUCT]
 
     if not all(col in df_filtered.columns for col in group_cols):
         st.info("No forecast data available for the selected filters.")
@@ -287,32 +305,27 @@ def display_forecast_table(df_filtered, active_region):
     forecast_data = []
 
     # Get unique combinations
-    unique_combos = df_filtered.groupby(group_cols).size().reset_index()[group_cols]
-    # unique_combos = unique_combos.head(6)  # Limit to first 6 for display
+    unique_combos = df_filtered.groupby(group_cols, dropna=False).size().reset_index()[group_cols]
 
     for _, row in unique_combos.iterrows():
         loc_prod_data = df_filtered[
             (df_filtered[group_cols[0]] == row[group_cols[0]]) &
-            (df_filtered["Product"] == row["Product"])
+            (df_filtered[COL_PRODUCT] == row[COL_PRODUCT])
         ]
 
-        beg_inv_row = loc_prod_data[loc_prod_data["Date"].dt.date == last_month_end]
-        if not beg_inv_row.empty:
-            beginning_inv = beg_inv_row["Close Inv"].iloc[0]
-        else:
-            beginning_inv = 0
+        # Beginning inventory (last day of previous month)
+        beg_inv_row = loc_prod_data[loc_prod_data[COL_DATE].dt.date == last_month_end]
+        beginning_inv = beg_inv_row[COL_CLOSE_INV_RAW].iloc[0] if not beg_inv_row.empty else 0
 
-        proj_inv_row = loc_prod_data[loc_prod_data["Date"].dt.date == curr_month_end]
-        if not proj_inv_row.empty:
-            projected_eom = proj_inv_row["Close Inv"].iloc[0]
-        else:
-            projected_eom = 0
+        # Projected EOM (last day of current month)
+        proj_inv_row = loc_prod_data[loc_prod_data[COL_DATE].dt.date == curr_month_end]
+        projected_eom = proj_inv_row[COL_CLOSE_INV_RAW].iloc[0] if not proj_inv_row.empty else 0
 
         build_draw = projected_eom - beginning_inv
 
         forecast_row = {
             group_cols[0]: row[group_cols[0]],
-            "Product": row["Product"],
+            COL_PRODUCT: row[COL_PRODUCT],
             "Beginning inventory": round(beginning_inv, 0),
             "Projected EOM": round(projected_eom, 0),
             "Build/Draw": round(build_draw, 0),
@@ -321,10 +334,10 @@ def display_forecast_table(df_filtered, active_region):
 
     if forecast_data:
         forecast_df = pd.DataFrame(forecast_data)
-        if group_cols[0] == "System":
-            forecast_df = forecast_df.rename(columns={"System": "Location"})
+        if group_cols[0] == COL_SYSTEM:
+            forecast_df = forecast_df.rename(columns={COL_SYSTEM: COL_LOCATION})
 
-        forecast_cols = ["Location", "Product", "Beginning inventory", "Projected EOM", "Build/Draw"]
+        forecast_cols = [COL_LOCATION, COL_PRODUCT, "Beginning inventory", "Projected EOM", "Build/Draw"]
         forecast_cols = [c for c in forecast_cols if c in forecast_df.columns]
         # st.dataframe(forecast_df[forecast_cols], width="stretch", height=320)
         st.dataframe(

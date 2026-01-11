@@ -1,49 +1,58 @@
 import pandas as pd
 
+
+FORECAST_VISIBLE_COLS: tuple[str, ...] = ("Rack/Lifting", "Opening Inv", "Close Inv")
+
+# Columns we display in the details editor that may need formatting/hiding.
+DISPLAY_NUMERIC_COLS: tuple[str, ...] = (
+    "Opening Inv",
+    "Close Inv",
+    "Batch In",
+    "Batch Out",
+    "Rack/Lifting",
+    "Pipeline In",
+    "Pipeline Out",
+    "Adjustments",
+    "Gain/Loss",
+    "Transfers",
+    "Production",
+)
+
+
 def _format_forecast_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Return a display-friendly dataframe for the details editor.
+
+    - Formats numeric columns with thousand separators and 2 decimals.
+    - For rows where ``source == 'forecast'``, hides values for flow columns
+      (everything except :data:`FORECAST_VISIBLE_COLS`) by displaying ``0.00``.
+
+    Note: This function intentionally returns *strings* for the formatted columns.
     """
-    Format display values:
-    1. Add thousand separators to all numeric columns
-    2. Hide forecast values except for Rack/Lifting, Opening Inv, Close Inv
-    """
+
+    if df is None or df.empty:
+        return df
+
     df_display = df.copy()
-    
-    # Columns that should show forecast values
-    FORECAST_VISIBLE_COLS = ["Rack/Lifting", "Opening Inv", "Close Inv"]
-    
-    # Get all numeric columns
-    numeric_cols = [
-        "Opening Inv", "Close Inv", "Batch In", "Batch Out", 
-        "Rack/Lifting", "Pipeline In", "Pipeline Out", 
-        "Adjustments", "Gain/Loss", "Transfers", "Production"
-    ]
-    
-    for col in numeric_cols:
+    is_forecast = (
+        df_display.get("source", "")
+        .astype(str)
+        .str.strip()
+        .str.lower()
+        .eq("forecast")
+    )
+
+    for col in DISPLAY_NUMERIC_COLS:
         if col not in df_display.columns:
             continue
-        
-        # Convert entire column to list for processing
-        formatted_values = []
-        
-        # For each row, check if it's a forecast row
-        for idx in df_display.index:
-            source = str(df_display.at[idx, "source"]).strip().lower() if "source" in df_display.columns else ""
-            value = df_display.at[idx, col]
-            
-            # If it's a forecast row and column should be hidden
-            if source == "forecast" and col not in FORECAST_VISIBLE_COLS:
-                formatted_values.append("0.00")  # Hide with 0.00 as string
-            elif pd.notna(value) and value != "":
-                # Format with thousand separators
-                try:
-                    num_val = float(value)
-                    formatted_values.append(f"{num_val:,.2f}")
-                except (ValueError, TypeError):
-                    formatted_values.append(str(value))  # Convert to string anyway
-            else:
-                formatted_values.append("0.00")  # Handle NaN/empty as "0.00"
-        
-        # Replace entire column with formatted strings
-        df_display[col] = formatted_values
-    
+
+        # Coerce to numeric for formatting; non-numeric values become NaN.
+        s_num = pd.to_numeric(df_display[col], errors="coerce")
+
+        # Hide forecast flows (keep Opening/Close + Rack/Lifting visible).
+        if col not in FORECAST_VISIBLE_COLS:
+            s_num = s_num.mask(is_forecast, 0.0)
+
+        # Format as strings for TextColumn rendering.
+        df_display[col] = s_num.fillna(0.0).map(lambda v: f"{float(v):,.2f}")
+
     return df_display
