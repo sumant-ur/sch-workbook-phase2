@@ -131,9 +131,31 @@ def _to_float(x) -> float:
     try:
         if x is None or (isinstance(x, float) and pd.isna(x)):
             return 0.0
+        # Streamlit editor may return formatted strings (e.g. "1,234.00").
+        # Also guard against blanks / em-dash placeholders.
+        if isinstance(x, str):
+            s = x.strip()
+            if s in {"", "—", "-"}:
+                return 0.0
+            # remove thousands separators
+            s = s.replace(",", "")
+            return float(s)
         return float(x)
     except Exception:
         return 0.0
+
+
+def _to_numeric_series(s: pd.Series) -> pd.Series:
+    """Coerce a Series to numeric, tolerating formatted strings like '1,234.00'."""
+    if s is None:
+        return s
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.to_numeric(s, errors="coerce")
+    # Remove commas in strings, then coerce.
+    s2 = s.astype(str).str.replace(",", "", regex=False).str.strip()
+    # Treat blanks / em dashes as NaN
+    s2 = s2.replace({"": np.nan, "—": np.nan, "-": np.nan})
+    return pd.to_numeric(s2, errors="coerce")
 
 
 def _sum_row(row: pd.Series, cols: list[str]) -> float:
@@ -167,7 +189,7 @@ def _recalculate_open_close_inv(df: pd.DataFrame, *, id_col: str) -> pd.DataFram
     ]
     for c in numeric_candidates:
         if c in out.columns:
-            out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0)
+            out[c] = _to_numeric_series(out[c]).fillna(0.0)
 
     group_cols = [id_col]
     if "Product" in out.columns:
@@ -228,7 +250,16 @@ def _recalculate_open_close_inv(df: pd.DataFrame, *, id_col: str) -> pd.DataFram
 
         return g
 
-    out = out.groupby(group_cols, dropna=False, group_keys=False).apply(_apply)
+    # Avoid `GroupBy.apply` to prevent pandas FutureWarning and keep behavior
+    # stable across pandas versions.
+
+    parts: list[pd.DataFrame] = []
+    for _, g in out.groupby(group_cols, dropna=False, sort=False):
+        parts.append(_apply(g))
+
+    out = pd.concat(parts, axis=0) if parts else out
+    # Preserve stable UI ordering.
+    out = out.sort_values(sort_cols, kind="mergesort")
 
     # Make sure the UI sees date-only values.
     out["Date"] = pd.to_datetime(out["Date"], errors="coerce").dt.date
@@ -253,8 +284,9 @@ def _needs_inventory_rerun(before: pd.DataFrame, after: pd.DataFrame) -> bool:
     for c in ["Opening Inv", "Close Inv"]:
         if c not in before.columns or c not in after.columns:
             continue
-        b = pd.to_numeric(before[c], errors="coerce").fillna(0.0).to_numpy(dtype=float)
-        a = pd.to_numeric(after[c], errors="coerce").fillna(0.0).to_numpy(dtype=float)
+        # The editor may return strings with commas; normalize them before compare.
+        b = _to_numeric_series(before[c]).fillna(0.0).to_numpy(dtype=float)
+        a = _to_numeric_series(after[c]).fillna(0.0).to_numpy(dtype=float)
         if not np.allclose(a, b, rtol=0, atol=1e-9):
             return True
     return False
@@ -596,7 +628,13 @@ def _build_editor_df(df_display: pd.DataFrame, *, id_col: str, ui_cols: list[str
     return df_display[desired].reset_index(drop=True)
 
 
-def display_midcon_details(df_filtered: pd.DataFrame, active_region: str, forecast_end: pd.Timestamp):
+def display_midcon_details(
+    df_filtered: pd.DataFrame,
+    active_region: str,
+    *,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+):
     st.subheader("🧾 Group Daily Details")
 
     if df_filtered.empty:
@@ -615,10 +653,9 @@ def display_midcon_details(df_filtered: pd.DataFrame, active_region: str, foreca
     # if 'source' in df_all.columns:
     #     st.info(f"Source breakdown: {df_all['source'].value_counts().to_dict()}")
 
-    # FIX: Extend forecast_end by 30 days to actually generate forecasts
-    actual_forecast_end = forecast_end + pd.Timedelta(days=30)
-
-    df_all = _extend_with_30d_forecast(df_filtered, id_col="System", forecast_end=actual_forecast_end)
+    # Forecast should be bounded by the user-selected date range.
+    # Admin-config date offsets are only used to set the *default* range in the sidebar.
+    df_all = _extend_with_30d_forecast(df_filtered, id_col="System", forecast_end=end_ts)
 
     df_display, cols = build_details_view(df_all, id_col="System")
 
@@ -642,7 +679,10 @@ def display_midcon_details(df_filtered: pd.DataFrame, active_region: str, foreca
     column_config = _column_config(df_display, cols, "System")
     column_config = {k: v for k, v in column_config.items() if k in column_order}
 
-    base_key = f"{active_region}_edit"
+    # IMPORTANT: the editor keeps its own dataframe in session_state.
+    # If we don't include the current filters in the keys, changing the sidebar
+    # date range (or selected System) won't refresh the table.
+    base_key = f"{active_region}|{scope_sys or ''}|{pd.Timestamp(start_ts).date()}|{pd.Timestamp(end_ts).date()}_edit"
     df_key = f"{base_key}__df"
     ver_key = f"{base_key}__ver"
     # Product filter removed; don't invalidate editor state based on products.
@@ -661,7 +701,7 @@ def display_midcon_details(df_filtered: pd.DataFrame, active_region: str, foreca
 
     edited = st.data_editor(
         styled,
-        use_container_width=True,
+        width="stretch",
         height=400,
         hide_index=True,
         column_order=column_order,
@@ -682,7 +722,13 @@ def display_midcon_details(df_filtered: pd.DataFrame, active_region: str, foreca
     st.markdown("</div>", unsafe_allow_html=True)
 
 
-def display_location_details(df_filtered: pd.DataFrame, active_region: str, forecast_end: pd.Timestamp):
+def display_location_details(
+    df_filtered: pd.DataFrame,
+    active_region: str,
+    *,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+):
     """Non-Midcon details view.
 
     New UX: user selects a single Location in sidebar, then we show tabs by
@@ -718,8 +764,8 @@ def display_location_details(df_filtered: pd.DataFrame, active_region: str, fore
         with tab:
             df_prod = df_loc[df_loc["Product"].astype(str) == str(prod_name)]
 
-            actual_forecast_end = forecast_end + pd.Timedelta(days=30)
-            df_all = _extend_with_30d_forecast(df_prod, id_col="Location", forecast_end=actual_forecast_end)
+            # Forecast should be bounded by the user-selected date range.
+            df_all = _extend_with_30d_forecast(df_prod, id_col="Location", forecast_end=end_ts)
             df_display, cols = build_details_view(df_all, id_col="Location")
 
             bottom, safefill = _threshold_values(region=active_region, location=str(selected_loc))
@@ -736,7 +782,11 @@ def display_location_details(df_filtered: pd.DataFrame, active_region: str, fore
             column_config = _column_config(df_display, cols, "Location")
             column_config = {k: v for k, v in column_config.items() if k in column_order}
 
-            base_key = f"{active_region}_{selected_loc}_{prod_name}_edit"
+            # Include filters in the key so changing sidebar date range refreshes the editor.
+            base_key = (
+                f"{active_region}_{selected_loc}_{prod_name}"
+                f"|{pd.Timestamp(start_ts).date()}|{pd.Timestamp(end_ts).date()}_edit"
+            )
             df_key = f"{base_key}__df"
             ver_key = f"{base_key}__ver"
             widget_key = f"{base_key}__v{int(st.session_state.get(ver_key, 0))}"
@@ -745,13 +795,17 @@ def display_location_details(df_filtered: pd.DataFrame, active_region: str, fore
             if df_key not in st.session_state or list(st.session_state[df_key].columns) != list(editor_df.columns):
                 st.session_state[df_key] = _recalculate_open_close_inv(editor_df, id_col="Location")
 
+            # Streamlit warning: when `num_rows='dynamic'`, `hide_index=True` only
+            # works if the input df uses a RangeIndex. Ensure that here.
+            st.session_state[df_key] = st.session_state[df_key].reset_index(drop=True)
+
             formatted_df = _format_forecast_display(st.session_state[df_key])
             styled = _style_source_cells(formatted_df, locked_cols)
 
             edited = st.data_editor(
                 styled,
                 num_rows="dynamic",
-                use_container_width=True,
+                width="stretch",
                 height=DETAILS_EDITOR_HEIGHT_PX,
                 hide_index=True,
                 column_order=column_order,
@@ -771,8 +825,20 @@ def display_location_details(df_filtered: pd.DataFrame, active_region: str, fore
             st.markdown("</div>", unsafe_allow_html=True)
 
 
-def display_details_tab(df_filtered: pd.DataFrame, active_region: str, end_ts: pd.Timestamp):
+def display_details_tab(
+    df_filtered: pd.DataFrame,
+    active_region: str,
+    *,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+):
+    # NOTE:
+    # `df_filtered` is expected to already be filtered by the DB query using
+    # start_ts/end_ts (see data_loader.load_filtered_inventory_data).
+    # We pass the timestamps here so Details can (a) bound forecast generation
+    # and (b) key editor state by the active filter window so changing dates in
+    # the sidebar refreshes the table.
     if active_region == "Midcon":
-        display_midcon_details(df_filtered, active_region, forecast_end=end_ts)
+        display_midcon_details(df_filtered, active_region, start_ts=start_ts, end_ts=end_ts)
     else:
-        display_location_details(df_filtered, active_region, forecast_end=end_ts)
+        display_location_details(df_filtered, active_region, start_ts=start_ts, end_ts=end_ts)

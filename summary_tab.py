@@ -171,7 +171,11 @@ def display_regional_summary(df_filtered, active_region):
         window = g[g[COL_DATE] <= latest_date].tail(7)
         return pd.Series({"Seven_Day_Avg_Sales": window["Sales"].mean() if not window.empty else 0})
 
-    seven_day = daily.groupby(group_cols).apply(compute_7day_avg).reset_index()
+    seven_day = (
+        daily.groupby(group_cols)
+        .apply(compute_7day_avg, include_groups=False)
+        .reset_index()
+    )
 
     # Latest inventory
     latest = (
@@ -269,8 +273,8 @@ def display_regional_summary(df_filtered, active_region):
 
     st.dataframe(
         display_df[final_cols],
-        use_container_width=True,
-        height=320
+        width="stretch",
+        height=320,
     )
 
 
@@ -342,8 +346,8 @@ def display_forecast_table(df_filtered, active_region):
         # st.dataframe(forecast_df[forecast_cols], width="stretch", height=320)
         st.dataframe(
             forecast_df[forecast_cols],
-            use_container_width=True,
-            height=320
+            width="stretch",
+            height=320,
         )
 
     else:

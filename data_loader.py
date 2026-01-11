@@ -423,24 +423,24 @@ def create_sidebar_filters(regions: list[str], df_region: pd.DataFrame) -> dict:
     """Create sidebar filters UI.
 
     This replaces sidebar_filters.py.
-    Key differences vs old behavior:
+
+    Key behavior:
     - Location/System is **single-select**
     - Product filter removed
-    - Designed to be used inside a Streamlit form with a submit button
+    - Designed to be used with a submit button (data loads on submit)
+
+    IMPORTANT UX NOTE:
+    The Region selector is expected to live **outside** the form so that changing
+    Region immediately triggers a rerun and we can refresh the Location/System
+    options without requiring the user to hit Submit.
     """
 
-    st.header("🔍 Filters")
+    active_region = st.session_state.get("active_region")
 
-    # Region selector
-    if regions:
-        active_region = st.selectbox("Select Region", regions, key="active_region")
-    else:
-        active_region = None
-        st.warning("No regions available")
-
-    # Location/System selector
+    # Location/System selector (options depend on active_region)
     loc_col = "System" if _normalize_region_label(active_region) == "Midcon" else "Location"
     filter_label = "🏭 System" if loc_col == "System" else "📍 Location"
+
     if df_region is not None and not df_region.empty and loc_col in df_region.columns:
         locations = sorted(df_region[loc_col].dropna().unique().tolist())
         df_min = df_region["Date"].min() if "Date" in df_region.columns else pd.NaT
@@ -451,13 +451,29 @@ def create_sidebar_filters(regions: list[str], df_region: pd.DataFrame) -> dict:
         df_min = meta.get("min_date", pd.NaT)
         df_max = meta.get("max_date", pd.NaT)
 
+    # If user previously selected a location that isn't in this region anymore,
+    # reset it so Streamlit doesn't get stuck with an invalid widget state.
+    prev_loc = st.session_state.get("selected_loc")
+    if prev_loc is not None and prev_loc not in locations:
+        st.session_state.selected_loc = None
+
     if not locations:
         st.warning("No locations available")
         selected_loc = None
     else:
-        selected_loc = st.selectbox(filter_label, options=locations, index=0, key="selected_loc")
+        # Streamlit selectbox requires an integer index.
+        # If we already have a valid selection, point the widget at it.
+        current = st.session_state.get("selected_loc")
+        index = locations.index(current) if current in locations else 0
+        selected_loc = st.selectbox(filter_label, options=locations, index=index, key="selected_loc")
 
     # Date range selector
+    # NOTE ON CIRCULAR IMPORTS:
+    # We import `get_default_date_window` *inside* this function to avoid a
+    # module-level circular import:
+    #   admin_config -> imports data_loader
+    #   data_loader  -> importing admin_config at import-time would recurse
+    # This is not an infinite loop at runtime; it's simply a safe import pattern.
     today = date.today()
     scope_location = None if selected_loc is None else str(selected_loc)
     from admin_config import get_default_date_window
@@ -668,6 +684,9 @@ def load_filtered_inventory_data(filters: dict) -> pd.DataFrame:
 
 def require_selected_location(filters: dict) -> None:
     """Enforce that a location/system must be selected before loading data."""
+    # NOTE:
+    # `st.stop()` does not cause recursion; it just halts the current Streamlit
+    # script run. Streamlit will re-run normally on the next user interaction.
     if filters.get("selected_loc") in (None, ""):
         st.warning("Please select a Location/System before submitting filters.")
         st.stop()
