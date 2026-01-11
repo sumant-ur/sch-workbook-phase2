@@ -12,7 +12,7 @@ from data_loader import initialize_data, ensure_numeric_columns
 from sidebar_filters import create_sidebar_filters, apply_filters
 from summary_tab import display_regional_summary, display_forecast_table
 from details_tab import display_details_tab
-from admin_panel import display_super_admin_panel
+from admin_config import display_super_admin_panel
 
 
 def main():

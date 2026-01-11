@@ -156,7 +156,7 @@ def display_regional_summary(df_filtered, active_region):
 
     # Latest inventory
     latest = (
-        daily[daily["Date"] == latest_date]
+        daily
         .sort_values(["Date"])
         .groupby(group_cols, as_index=False)
         .last()
@@ -281,7 +281,7 @@ def display_forecast_table(df_filtered, active_region):
 
     # Get unique combinations
     unique_combos = df_filtered.groupby(group_cols).size().reset_index()[group_cols]
-    unique_combos = unique_combos.head(6)  # Limit to first 6 for display
+    # unique_combos = unique_combos.head(6)  # Limit to first 6 for display
 
     for _, row in unique_combos.iterrows():
         loc_prod_data = df_filtered[
